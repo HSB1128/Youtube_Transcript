@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
-.venv/
+.venv
 venv/
 .git/
+.gitignore
+README.md
