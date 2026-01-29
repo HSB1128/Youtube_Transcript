@@ -1,48 +1,78 @@
 # app/transcript.py
 from __future__ import annotations
+
+import os
 from typing import Any, Dict, List, Optional
 
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    VideoUnavailable,
+    CouldNotRetrieveTranscript,
+)
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 
 
-def _to_segments(obj: Any) -> List[Dict[str, Any]]:
+def _build_ytt_api() -> YouTubeTranscriptApi:
     """
-    youtube-transcript-api 1.2.3:
-      - fetch() returns FetchedTranscript (iterable) with .to_raw_data()
-    legacy:
-      - get_transcript() returns List[dict]
+    Cloud Run/GCP 같은 데이터센터 IP에서 유튜브가 transcript 요청을 막는 케이스가 많아서
+    youtube-transcript-api가 proxy_config를 공식 지원함.
+
+    env 우선순위:
+      1) Webshare 프록시:
+         - WEBSHARE_PROXY_USERNAME
+         - WEBSHARE_PROXY_PASSWORD
+         - (옵션) WEBSHARE_FILTER_IP_LOCATIONS=kr,us,jp
+      2) Generic 프록시:
+         - PROXY_HTTP_URL=http://user:pass@host:port
+         - PROXY_HTTPS_URL=https://user:pass@host:port
+      3) 프록시 없음
     """
-    if obj is None:
-        return []
-    # 1) 1.2.3 FetchedTranscript
-    if hasattr(obj, "to_raw_data"):
-        try:
-            raw = obj.to_raw_data()
-            # normalize key names just in case
-            out = []
-            for s in raw:
-                out.append({
-                    "text": s.get("text", ""),
-                    "start": float(s.get("start", 0.0)),
-                    "duration": float(s.get("duration", 0.0)),
-                })
-            return out
-        except Exception:
-            pass
+    ws_user = os.getenv("WEBSHARE_PROXY_USERNAME", "").strip()
+    ws_pass = os.getenv("WEBSHARE_PROXY_PASSWORD", "").strip()
+    ws_locs = os.getenv("WEBSHARE_FILTER_IP_LOCATIONS", "").strip()
 
-    # 2) legacy list[dict]
-    if isinstance(obj, list):
-        out = []
-        for s in obj:
-            if isinstance(s, dict):
-                out.append({
-                    "text": s.get("text", ""),
-                    "start": float(s.get("start", 0.0)),
-                    "duration": float(s.get("duration", 0.0)),
-                })
-        return out
+    if ws_user and ws_pass:
+        filter_locs = None
+        if ws_locs:
+            filter_locs = [x.strip() for x in ws_locs.split(",") if x.strip()]
+        proxy_cfg = WebshareProxyConfig(
+            proxy_username=ws_user,
+            proxy_password=ws_pass,
+            filter_ip_locations=filter_locs,
+        )
+        return YouTubeTranscriptApi(proxy_config=proxy_cfg)
 
-    return []
+    http_url = os.getenv("PROXY_HTTP_URL", "").strip()
+    https_url = os.getenv("PROXY_HTTPS_URL", "").strip()
+    if http_url or https_url:
+        proxy_cfg = GenericProxyConfig(
+            http_url=http_url or None,
+            https_url=https_url or None,
+        )
+        return YouTubeTranscriptApi(proxy_config=proxy_cfg)
+
+    return YouTubeTranscriptApi()
+
+
+# ✅ 싱글톤(요청마다 새로 만들면 느리고 안정성도 떨어짐)
+_YTT_API = _build_ytt_api()
+
+
+def _normalize_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for s in segments or []:
+        if not isinstance(s, dict):
+            continue
+        out.append(
+            {
+                "text": s.get("text", "") or "",
+                "start": float(s.get("start") or 0.0),
+                "duration": float(s.get("duration") or 0.0),
+            }
+        )
+    return out
 
 
 def fetch_best_transcript(
@@ -50,121 +80,102 @@ def fetch_best_transcript(
     languages_priority: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Returns:
-      {
-        ok: bool,
-        sourceType: "MANUAL" | "AUTO" | "TRANSLATED" | "FETCH" | "NONE",
-        language: str|None,
-        languageCode: str|None,
-        isGenerated: bool|None,
-        segments: [ {text,start,duration}, ... ],
-        detail: { ... optional debug info ... }
-      }
+    목표:
+      1) list_transcripts(또는 list) 기반으로 "수동 → 자동 → 번역" 최대한 확보
+      2) list 계열 메서드가 없거나 깨지면: get_transcript를 언어 우선순위대로 순차 시도
+      3) 전부 실패하면 sourceType=NONE
+
+    반환:
+    {
+      ok, sourceType(MANUAL/AUTO/TRANSLATED/FETCH/NONE),
+      language, languageCode, isGenerated,
+      segments, detail
+    }
     """
-    languages_priority = languages_priority or ["ko", "ko-KR", "en", "en-US", "en-GB"]
+    langs = [l.strip() for l in (languages_priority or []) if isinstance(l, str) and l.strip()]
+    if not langs:
+        langs = ["ko", "ko-KR", "en", "en-US", "en-GB"]
 
-    # --- 0) legacy API path (only if exists) ---
-    # Some older versions had classmethods list_transcripts/get_transcript.
+    # -----------------------------------------
+    # 1) list_transcripts / list 기반 (가능하면 이게 제일 강력)
+    #    - 버전에 따라 API 이름이 다를 수 있어: list_transcripts 또는 list
+    # -----------------------------------------
     try:
-        if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-            # Legacy transcript list approach
-            tl = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = None
 
-            # MANUAL → AUTO → TRANSLATED
-            # (Legacy TranscriptList API may differ by version; keep try/except tight.)
-            for kind in ("MANUAL", "AUTO"):
-                try:
-                    if kind == "MANUAL":
-                        tr = tl.find_manually_created_transcript(languages_priority)
-                    else:
-                        tr = tl.find_generated_transcript(languages_priority)
-                    fetched = tr.fetch()
-                    segs = _to_segments(fetched)
-                    if segs:
-                        return {
-                            "ok": True,
-                            "sourceType": "MANUAL" if kind == "MANUAL" else "AUTO",
-                            "language": getattr(tr, "language", None),
-                            "languageCode": getattr(tr, "language_code", None),
-                            "isGenerated": getattr(tr, "is_generated", None),
-                            "segments": segs,
-                            "detail": {"path": "legacy_list_transcripts"},
-                        }
-                except Exception:
-                    pass
+        if hasattr(_YTT_API, "list_transcripts"):
+            transcript_list = _YTT_API.list_transcripts(video_id)
+            list_method = "list_transcripts"
+        elif hasattr(_YTT_API, "list"):
+            transcript_list = _YTT_API.list(video_id)
+            list_method = "list"
+        else:
+            transcript_list = None
+            list_method = None
 
-            # TRANSLATED: pick any translatable transcript, translate to first target language that works
+        if transcript_list is not None:
+            # 1-1) 수동 자막
             try:
-                base = None
-                for t in tl:
-                    if getattr(t, "is_translatable", False):
-                        base = t
-                        break
-                if base is not None:
-                    for target in languages_priority:
-                        try:
-                            translated = base.translate(target)
-                            fetched = translated.fetch()
-                            segs = _to_segments(fetched)
-                            if segs:
-                                return {
-                                    "ok": True,
-                                    "sourceType": "TRANSLATED",
-                                    "language": getattr(translated, "language", None),
-                                    "languageCode": getattr(translated, "language_code", None),
-                                    "isGenerated": getattr(base, "is_generated", None),
-                                    "segments": segs,
-                                    "detail": {
-                                        "path": "legacy_translate",
-                                        "baseLanguageCode": getattr(base, "language_code", None),
-                                        "target": target,
-                                    },
-                                }
-                        except Exception:
-                            continue
+                t = transcript_list.find_manually_created_transcript(langs)
+                segs = _normalize_segments(t.fetch())
+                if segs:
+                    return {
+                        "ok": True,
+                        "sourceType": "MANUAL",
+                        "language": getattr(t, "language", None),
+                        "languageCode": getattr(t, "language_code", None),
+                        "isGenerated": getattr(t, "is_generated", None),
+                        "segments": segs,
+                        "detail": {"path": f"{list_method}->manual"},
+                    }
             except Exception:
                 pass
 
-            return {
-                "ok": False,
-                "sourceType": "NONE",
-                "language": None,
-                "languageCode": None,
-                "isGenerated": None,
-                "segments": [],
-                "detail": {"error": "LEGACY_LIST_TRANSCRIPTS_FOUND_BUT_NO_MATCH"},
-            }
-    except Exception as e:
-        # fall through to 1.2.3 path
-        legacy_err = str(e)
-    else:
-        legacy_err = None
+            # 1-2) 자동 생성 자막
+            try:
+                t = transcript_list.find_generated_transcript(langs)
+                segs = _normalize_segments(t.fetch())
+                if segs:
+                    return {
+                        "ok": True,
+                        "sourceType": "AUTO",
+                        "language": getattr(t, "language", None),
+                        "languageCode": getattr(t, "language_code", None),
+                        "isGenerated": getattr(t, "is_generated", None),
+                        "segments": segs,
+                        "detail": {"path": f"{list_method}->auto"},
+                    }
+            except Exception:
+                pass
 
-    # --- 1) youtube-transcript-api 1.2.3 (official) ---
-    # Use ytt_api.list(video_id) and find_* methods, then fetch().
-    try:
-        ytt_api = YouTubeTranscriptApi()
-
-        # 1) list available transcripts
-        if not hasattr(ytt_api, "list"):
-            # ultra-fallback: try legacy get_transcript if available
-            if hasattr(YouTubeTranscriptApi, "get_transcript"):
-                for lang in languages_priority:
+            # 1-3) 번역 자막(가능하면)
+            #      "선호 언어(보통 ko)"로 번역 가능한 transcript가 있으면 translate() 후 fetch()
+            try:
+                target = langs[0]  # 예: ko
+                for base in transcript_list:
                     try:
-                        raw = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
-                        segs = _to_segments(raw)
+                        translated = base.translate(target)
+                        segs = _normalize_segments(translated.fetch())
                         if segs:
                             return {
                                 "ok": True,
-                                "sourceType": "FETCH",
-                                "language": None,
-                                "languageCode": lang,
-                                "isGenerated": None,
+                                "sourceType": "TRANSLATED",
+                                "language": getattr(translated, "language", None),
+                                "languageCode": getattr(translated, "language_code", None),
+                                "isGenerated": getattr(translated, "is_generated", None),
                                 "segments": segs,
-                                "detail": {"path": "fallback_get_transcript", "lang": lang},
+                                "detail": {
+                                    "path": f"{list_method}->translate",
+                                    "target": target,
+                                    "baseLanguageCode": getattr(base, "language_code", None),
+                                },
                             }
                     except Exception:
                         continue
+            except Exception:
+                pass
+
+            # list는 성공했는데 매칭 실패
             return {
                 "ok": False,
                 "sourceType": "NONE",
@@ -172,111 +183,49 @@ def fetch_best_transcript(
                 "languageCode": None,
                 "isGenerated": None,
                 "segments": [],
-                "detail": {"error": "NO_LIST_METHOD_ON_YTT_API"},
+                "detail": {"error": "NO_MATCH_IN_LIST", "path": list_method},
             }
 
-        transcript_list = ytt_api.list(video_id)
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, CouldNotRetrieveTranscript) as e:
+        # ✅ 네가 지금 맞고 있는 "클라우드 IP 차단"도 여기로 떨어지는 경우가 흔함
+        return {
+            "ok": False,
+            "sourceType": "NONE",
+            "language": None,
+            "languageCode": None,
+            "isGenerated": None,
+            "segments": [],
+            "detail": {"error": "LIST_OR_FETCH_FAILED", "message": str(e)},
+        }
+    except Exception as e:
+        # list 단계 자체가 깨지면 아래 get_transcript 폴백으로
+        list_error = str(e)
+    else:
+        list_error = None
 
-        # 2) MANUAL first
-        try:
-            t = transcript_list.find_manually_created_transcript(languages_priority)
-            fetched = t.fetch()
-            segs = _to_segments(fetched)
-            if segs:
-                return {
-                    "ok": True,
-                    "sourceType": "MANUAL",
-                    "language": getattr(t, "language", None),
-                    "languageCode": getattr(t, "language_code", None),
-                    "isGenerated": getattr(t, "is_generated", None),  # should be False
-                    "segments": segs,
-                    "detail": {"path": "v1.2.3_manual"},
-                }
-        except Exception:
-            pass
-
-        # 3) AUTO (generated) next
-        try:
-            t = transcript_list.find_generated_transcript(languages_priority)
-            fetched = t.fetch()
-            segs = _to_segments(fetched)
-            if segs:
-                return {
-                    "ok": True,
-                    "sourceType": "AUTO",
-                    "language": getattr(t, "language", None),
-                    "languageCode": getattr(t, "language_code", None),
-                    "isGenerated": getattr(t, "is_generated", None),  # should be True
-                    "segments": segs,
-                    "detail": {"path": "v1.2.3_auto"},
-                }
-        except Exception:
-            pass
-
-        # 4) TRANSLATED (YouTube auto-translate)
-        # pick a base transcript that is_translatable, translate to preferred target language
-        base = None
-        for t in transcript_list:
-            if getattr(t, "is_translatable", False):
-                base = t
-                break
-
-        if base is not None:
-            for target in languages_priority:
+    # -----------------------------------------
+    # 2) list 계열 메서드가 없거나/깨졌을 때: get_transcript를 언어별 순차 시도
+    #    - 이 경로는 수동/자동 구분이 어려워서 sourceType=FETCH로 표기
+    # -----------------------------------------
+    try:
+        if hasattr(YouTubeTranscriptApi, "get_transcript"):
+            for lang in langs:
                 try:
-                    translated = base.translate(target)
-                    fetched = translated.fetch()
-                    segs = _to_segments(fetched)
+                    segs_raw = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
+                    segs = _normalize_segments(segs_raw)
                     if segs:
                         return {
                             "ok": True,
-                            "sourceType": "TRANSLATED",
-                            "language": getattr(translated, "language", None),
-                            "languageCode": getattr(translated, "language_code", None),
-                            "isGenerated": getattr(base, "is_generated", None),
+                            "sourceType": "FETCH",
+                            "language": lang,
+                            "languageCode": lang,
+                            "isGenerated": None,
                             "segments": segs,
-                            "detail": {
-                                "path": "v1.2.3_translated",
-                                "baseLanguageCode": getattr(base, "language_code", None),
-                                "target": target,
-                            },
+                            "detail": {"path": "get_transcript", "tried": langs, "list_error": list_error},
                         }
                 except Exception:
                     continue
 
-        # 5) last resort: direct fetch() with languages_priority (module default prefers manual)
-        try:
-            fetched = ytt_api.fetch(video_id, languages=languages_priority)
-            segs = _to_segments(fetched)
-            if segs:
-                return {
-                    "ok": True,
-                    "sourceType": "FETCH",
-                    "language": getattr(fetched, "language", None),
-                    "languageCode": getattr(fetched, "language_code", None),
-                    "isGenerated": getattr(fetched, "is_generated", None),
-                    "segments": segs,
-                    "detail": {"path": "v1.2.3_fetch"},
-                }
-        except Exception as e:
-            fetch_err = str(e)
-        else:
-            fetch_err = None
-
-        return {
-            "ok": False,
-            "sourceType": "NONE",
-            "language": None,
-            "languageCode": None,
-            "isGenerated": None,
-            "segments": [],
-            "detail": {
-                "error": "NO_TRANSCRIPT",
-                "legacy_error": legacy_err,
-                "fetch_error": fetch_err,
-            },
-        }
-
     except Exception as e:
         return {
             "ok": False,
@@ -285,9 +234,18 @@ def fetch_best_transcript(
             "languageCode": None,
             "isGenerated": None,
             "segments": [],
-            "detail": {
-                "error": "LIST_OR_FETCH_FAILED",
-                "message": str(e),
-                "legacy_error": legacy_err,
-            },
+            "detail": {"error": "GET_TRANSCRIPT_FAILED", "message": str(e), "list_error": list_error},
         }
+
+    # -----------------------------------------
+    # 3) 완전 실패
+    # -----------------------------------------
+    return {
+        "ok": False,
+        "sourceType": "NONE",
+        "language": None,
+        "languageCode": None,
+        "isGenerated": None,
+        "segments": [],
+        "detail": {"error": "NO_TRANSCRIPT", "message": "No transcript available or blocked.", "list_error": list_error},
+    }
