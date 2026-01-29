@@ -4,10 +4,10 @@ from typing import List, Dict, Any, Optional
 import os
 
 from app.youtube_data import fetch_videos_metadata
-from app.transcript import fetch_best_transcript   # ★ 교체된 transcript.py 기준
+from app.transcript import fetch_best_transcript   # ★ fetch_best_transcript 구현되어 있어야 함
 from app.stt import stt_from_youtube_url
 
-app = FastAPI(title="YouTube Transcript Collector (Manual/Auto/Translated) + STT Fallback")
+app = FastAPI(title="YouTube Transcript Collector + Profile Analyzer (via Gemini downstream)")
 
 # ====== 환경변수 ======
 MAX_DURATION_SEC_FOR_STT = int(os.getenv("MAX_DURATION_SEC_FOR_STT", "900"))
@@ -17,13 +17,6 @@ ENABLE_STT = os.getenv("ENABLE_STT", "true").lower() == "true"
 # -----------------------------
 # Helpers
 # -----------------------------
-def _cut(s: str, n: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= n:
-        return s
-    return s[:n].rstrip() + "…"
-
-
 def compute_confidence(
     transcript_source: str,
     transcript_info: Dict[str, Any],
@@ -31,14 +24,12 @@ def compute_confidence(
     stt_ok: bool
 ) -> str:
     """
-    네가 요구한 규칙 그대로:
+    네 규칙:
     - 수동(MANUAL): high
     - 자동(AUTO): medium
-    - 번역(TRANSLATED): 잘 나오면 high, 이상하면 medium
-        -> 서버에서 완벽 판정은 어렵기 때문에,
-           번역 원본이 MANUAL이면 high, AUTO면 medium으로 분기
+    - 번역(TRANSLATED): 원본이 MANUAL이면 high, AUTO면 medium
     - STT 성공: medium
-    - 자막 실패 + STT 실패: low
+    - 자막/대본 확보 실패: low
     """
     if transcript_source == "MANUAL":
         return "high"
@@ -65,7 +56,7 @@ class AnalyzeReq(BaseModel):
     skip_stt_if_longer_than_sec: int = Field(default=MAX_DURATION_SEC_FOR_STT)
 
     # 응답 크기 제어
-    include_segments: bool = True  # Gemini에 통째로 던질 거면 True 권장
+    include_segments: bool = True  # 1차 분석 결과를 Gemini로 넘길 거면 True 권장
 
 
 @app.get("/health")
@@ -73,19 +64,31 @@ def health():
     return {"ok": True}
 
 
+# ✅ 기존 analyze도 유지해둘게 (테스트/호환용)
 @app.post("/analyze")
 def analyze(req: AnalyzeReq) -> Dict[str, Any]:
+    return _analyze_core(req)
+
+
+# ✅ 너가 n8n에서 부르는 엔드포인트
+@app.post("/analyze_and_profile")
+def analyze_and_profile(req: AnalyzeReq) -> Dict[str, Any]:
+    # 지금 단계에서는 "profile"을 서버에서 Gemini로 만들지 말고,
+    # 원데이터(자막/메타 + 라벨링 + confidence)를 돌려주는 역할만 수행.
+    # 2차 Gemini 노드가 이 출력을 받아 채널 기획안을 만들면 됨.
+    return _analyze_core(req)
+
+
+def _analyze_core(req: AnalyzeReq) -> Dict[str, Any]:
     if not req.urls:
         raise HTTPException(400, "urls is empty")
 
-    # 0) 메타데이터 수집
     meta = fetch_videos_metadata(req.urls, include_stats=req.include_stats)
 
     videos: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
 
     for idx, item in enumerate(meta.get("items", []), start=1):
-        # base meta output
         base_meta = {
             "title": item.get("title", ""),
             "description": item.get("description", ""),
@@ -95,7 +98,7 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
             "stats": item.get("stats") if req.include_stats else None,
         }
 
-        # 메타 조회 실패/URL invalid
+        # 메타 조회 실패
         if not item.get("ok"):
             videos.append({
                 "index": idx,
@@ -124,7 +127,7 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
         video_id = item["videoId"]
         duration_sec = int(item.get("durationSec") or 0)
 
-        # 1) 자막 최우선: 수동 → 자동 → 번역 (✅)
+        # 1) 자막 최우선: 수동 → 자동 → 번역
         tr = fetch_best_transcript(
             video_id=video_id,
             languages=req.languages,
@@ -140,7 +143,7 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
             "detail": tr.get("detail", {})
         }
 
-        # 2) 자막이 없으면 STT 폴백 (옵션)
+        # 2) 자막이 없으면 STT 폴백
         stt_used = False
         stt_ok = False
         stt_info: Optional[Dict[str, Any]] = None
@@ -163,7 +166,7 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
                 else:
                     stt_ok = False
 
-        # 3) confidence + needsTranscript 계산
+        # 3) confidence + needsTranscript
         confidence = compute_confidence(
             transcript_source=transcript_source,
             transcript_info=transcript_info,
@@ -172,7 +175,6 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
         )
         needs_transcript = (confidence == "low")
 
-        # 4) 최종 결과 구성
         out = {
             "index": idx,
             "url": url,
@@ -181,7 +183,7 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
             "meta": base_meta,
 
             "transcriptSource": transcript_source,  # MANUAL/AUTO/TRANSLATED/STT/NONE
-            "transcriptInfo": transcript_info,      # 어떤 자막을 잡았는지 상세
+            "transcriptInfo": transcript_info,
             "sttUsed": stt_used,
             "sttInfo": stt_info,
 
@@ -194,7 +196,6 @@ def analyze(req: AnalyzeReq) -> Dict[str, Any]:
         else:
             out["segments"] = None
 
-        # 경고 수집(자막/대본 확보 실패)
         if needs_transcript:
             warnings.append({
                 "index": idx,
