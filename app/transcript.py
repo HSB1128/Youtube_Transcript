@@ -1,10 +1,14 @@
+# app/transcript.py
 from typing import List, Dict, Any, Optional, Tuple
 from youtube_transcript_api import YouTubeTranscriptApi
 
-
-def _normalize_segments(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _to_segments(fetched) -> List[Dict[str, Any]]:
+    """
+    youtube-transcript-api의 FetchedTranscript를 raw list로 변환
+    """
+    raw = fetched.to_raw_data()  # [{text,start,duration},...]
     segs: List[Dict[str, Any]] = []
-    for x in raw or []:
+    for x in raw:
         text = (x.get("text") or "").strip()
         if not text:
             continue
@@ -15,175 +19,150 @@ def _normalize_segments(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         })
     return segs
 
-
-def _uniq_keep_order(xs: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in xs:
-        k = (x or "").strip().lower()
-        if not k:
-            continue
-        if k not in seen:
-            out.append((x or "").strip())
-            seen.add(k)
-    return out
-
-
-def _expand_languages(langs: List[str]) -> List[str]:
-    """
-    ko만/ en만 주더라도 변형을 함께 시도해 자막 매칭 확률을 높임.
-    """
-    base = _uniq_keep_order(langs or [])
-    if not base:
-        base = ["ko", "en"]
-
-    expanded: List[str] = []
-    for x in base:
-        lx = x.lower()
-        if lx in ["ko", "ko-kr"]:
-            expanded += ["ko", "ko-KR"]
-        elif lx in ["en", "en-us"]:
-            expanded += ["en", "en-US"]
-        else:
-            expanded.append(x)
-
-    return _uniq_keep_order(expanded)
-
-
 def fetch_best_transcript(
     video_id: str,
-    languages: List[str],
-    prefer_translate_targets: Optional[List[str]] = None,
+    languages_priority: List[str],
+    translate_targets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    반환:
+    youtube-transcript-api==1.2.3 기준으로
+    수동/자동/번역 자막을 최대한 확보.
+
+    반환 포맷:
     {
       "ok": bool,
-      "segments": [...],
-      "sourceType": "MANUAL" | "AUTO" | "TRANSLATED" | "NONE",
-      "language": "ko" 같은 코드,
-      "detail": { ... }
+      "sourceType": "MANUAL"|"AUTO"|"TRANSLATED"|"FETCH"|"NONE",
+      "language": str|None,
+      "languageCode": str|None,
+      "isGenerated": bool|None,
+      "detail": {...} | None,
+      "segments": [...]
     }
-
-    우선순위:
-    1) 수동 자막 (MANUAL)
-    2) 자동 생성 자막 (AUTO)
-    3) 번역 자막 (TRANSLATED)  - 가능한 경우
     """
-    prefer_langs = _expand_languages(languages)
-    translate_targets = _expand_languages(prefer_translate_targets or ["ko", "en"])
+    ytt_api = YouTubeTranscriptApi()
 
-    try:
-        tl = YouTubeTranscriptApi.list_transcripts(video_id)
-    except Exception as e:
-        return {
-            "ok": False,
-            "segments": [],
-            "sourceType": "NONE",
-            "language": None,
-            "detail": {"error": "LIST_TRANSCRIPTS_FAILED", "message": str(e)},
-        }
-
-    # --- 1) MANUAL 먼저: prefer_langs 순서대로 찾기 ---
-    # youtube_transcript_api는 find_transcript / find_manually_created_transcript 등을 제공
-    # (버전에 따라 차이가 있을 수 있어 try/except로 안전하게)
-    for lang in prefer_langs:
+    # 1) TranscriptList 기반 (가장 강력)
+    #    공식 문서: ytt_api.list(video_id) :contentReference[oaicite:2]{index=2}
+    if hasattr(ytt_api, "list"):
         try:
-            t = tl.find_manually_created_transcript([lang])
-            raw = t.fetch()
-            segs = _normalize_segments(raw)
-            if segs:
-                return {
-                    "ok": True,
-                    "segments": segs,
-                    "sourceType": "MANUAL",
-                    "language": getattr(t, "language_code", lang),
-                    "detail": {
-                        "requested": prefer_langs,
-                        "picked": lang,
-                        "isGenerated": False,
-                        "isTranslated": False,
-                    },
-                }
-        except Exception:
-            pass
+            transcript_list = ytt_api.list(video_id)
 
-    # --- 2) AUTO(자동 생성) ---
-    for lang in prefer_langs:
-        try:
-            t = tl.find_generated_transcript([lang])
-            raw = t.fetch()
-            segs = _normalize_segments(raw)
-            if segs:
-                return {
-                    "ok": True,
-                    "segments": segs,
-                    "sourceType": "AUTO",
-                    "language": getattr(t, "language_code", lang),
-                    "detail": {
-                        "requested": prefer_langs,
-                        "picked": lang,
-                        "isGenerated": True,
-                        "isTranslated": False,
-                    },
-                }
-        except Exception:
-            pass
-
-    # --- 3) TRANSLATED (번역 자막) ---
-    # 전략: (a) 어떤 자막이든 하나 잡아서 (b) translate_targets 우선순위로 translate 시도
-    # 번역은 원본이 manual인지 auto인지에 따라 신뢰도를 다르게 줄 수 있게 sourceOrigin 기록
-    source_origin = None
-    base_t = None
-
-    # 3-1) base transcript를 먼저 확보: manual 우선, 없으면 auto
-    try:
-        # manual 아무거나 하나
-        for t in tl:
-            if not getattr(t, "is_generated", False):
-                base_t = t
-                source_origin = "MANUAL"
-                break
-        if base_t is None:
-            for t in tl:
-                if getattr(t, "is_generated", False):
-                    base_t = t
-                    source_origin = "AUTO"
-                    break
-    except Exception:
-        base_t = None
-
-    if base_t is not None and getattr(base_t, "is_translatable", False):
-        for tgt in translate_targets:
+            # (A) 수동 자막 우선
             try:
-                tt = base_t.translate(tgt)
-                raw = tt.fetch()
-                segs = _normalize_segments(raw)
-                if segs:
-                    return {
-                        "ok": True,
-                        "segments": segs,
-                        "sourceType": "TRANSLATED",
-                        "language": tgt,
-                        "detail": {
-                            "translatedTo": tgt,
-                            "sourceOrigin": source_origin,   # MANUAL or AUTO
-                            "isGenerated": (source_origin == "AUTO"),
-                            "isTranslated": True,
-                        },
-                    }
+                t = transcript_list.find_manually_created_transcript(languages_priority)
+                fetched = t.fetch()
+                return {
+                    "ok": True,
+                    "sourceType": "MANUAL",
+                    "language": getattr(fetched, "language", None),
+                    "languageCode": getattr(fetched, "language_code", None),
+                    "isGenerated": getattr(fetched, "is_generated", None),
+                    "detail": None,
+                    "segments": _to_segments(fetched),
+                }
             except Exception:
                 pass
 
-    # 전부 실패
+            # (B) 자동 생성 자막
+            try:
+                t = transcript_list.find_generated_transcript(languages_priority)
+                fetched = t.fetch()
+                return {
+                    "ok": True,
+                    "sourceType": "AUTO",
+                    "language": getattr(fetched, "language", None),
+                    "languageCode": getattr(fetched, "language_code", None),
+                    "isGenerated": getattr(fetched, "is_generated", None),
+                    "detail": None,
+                    "segments": _to_segments(fetched),
+                }
+            except Exception:
+                pass
+
+            # (C) 번역 자막 (원문 자막이 translatable이면 translate() 가능) :contentReference[oaicite:3]{index=3}
+            # translate_targets를 안 주면 languages_priority를 대상으로 번역 시도
+            targets = translate_targets or languages_priority
+            # 원문 후보: TranscriptList에서 아무거나 찾기 (우선순위 언어 먼저)
+            base = None
+            try:
+                base = transcript_list.find_transcript(languages_priority)
+            except Exception:
+                # 우선순위 언어가 전혀 없으면 transcript_list 순회 중 첫 개로 시도
+                try:
+                    base = next(iter(transcript_list))
+                except Exception:
+                    base = None
+
+            if base is not None and getattr(base, "is_translatable", False):
+                for tgt in targets:
+                    try:
+                        translated = base.translate(tgt)  # :contentReference[oaicite:4]{index=4}
+                        fetched = translated.fetch()
+                        segs = _to_segments(fetched)
+                        if segs:
+                            return {
+                                "ok": True,
+                                "sourceType": "TRANSLATED",
+                                "language": getattr(fetched, "language", None),
+                                "languageCode": getattr(fetched, "language_code", None),
+                                "isGenerated": getattr(fetched, "is_generated", None),
+                                "detail": {
+                                    "baseLanguageCode": getattr(base, "language_code", None),
+                                    "targetLanguageCode": tgt,
+                                },
+                                "segments": segs,
+                            }
+                    except Exception:
+                        continue
+
+            return {
+                "ok": False,
+                "sourceType": "NONE",
+                "language": None,
+                "languageCode": None,
+                "isGenerated": None,
+                "detail": {"error": "NO_TRANSCRIPT_FOUND"},
+                "segments": [],
+            }
+
+        except Exception as e:
+            # list() 자체가 막힘 (IP 차단 등)
+            return {
+                "ok": False,
+                "sourceType": "NONE",
+                "language": None,
+                "languageCode": None,
+                "isGenerated": None,
+                "detail": {"error": "LIST_FAILED", "message": str(e)},
+                "segments": [],
+            }
+
+    # 2) fallback: list()가 없는 옛 API/환경이면 fetch()를 언어 우선순위대로 시도
+    # 공식 fetch(video_id, languages=[...]) :contentReference[oaicite:5]{index=5}
+    for lang in (languages_priority or []):
+        try:
+            fetched = ytt_api.fetch(video_id, languages=[lang], preserve_formatting=False)
+            segs = _to_segments(fetched)
+            if segs:
+                return {
+                    "ok": True,
+                    "sourceType": "FETCH",
+                    "language": getattr(fetched, "language", None),
+                    "languageCode": getattr(fetched, "language_code", None),
+                    "isGenerated": getattr(fetched, "is_generated", None),
+                    "detail": {"note": "fallback_fetch_used"},
+                    "segments": segs,
+                }
+        except Exception:
+            continue
+
+    # 최종 실패
     return {
         "ok": False,
-        "segments": [],
         "sourceType": "NONE",
         "language": None,
-        "detail": {
-            "requested": prefer_langs,
-            "translateTargets": translate_targets,
-            "error": "NO_TRANSCRIPT_FOUND",
-        },
+        "languageCode": None,
+        "isGenerated": None,
+        "detail": {"error": "FETCH_FAILED_ALL_LANGS"},
+        "segments": [],
     }
