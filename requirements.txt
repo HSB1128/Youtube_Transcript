@@ -5,3 +5,4 @@ requests==2.32.3
 
 youtube-transcript-api==1.2.3
 faster-whisper==1.0.3
+google-genai
