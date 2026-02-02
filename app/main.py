@@ -134,4 +134,65 @@ def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 warns.append({
                     "index": v.get("index"),
                     "url": v.get("url"),
-                    "stage": "gemini_video_analysi
+                    "stage": "gemini_video_analysis",
+                    "error": va.get("error"),
+                })
+    return warns
+
+@app.post("/analyze_and_profile")
+async def analyze_and_profile(req: AnalyzeReq) -> Dict[str, Any]:
+    urls = normalize_urls(req.urls)
+    if not urls:
+        raise HTTPException(400, "urls is empty")
+
+    lang_priority = pick_language_priority(req.languages)
+    sem = asyncio.Semaphore(req.concurrency)
+
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            _process_one(i + 1, url, lang_priority, sem, client)
+            for i, url in enumerate(urls)
+        ]
+        videos = await asyncio.gather(*tasks)
+
+    # 1) 채널 프로필 생성(성공+Gemini JSON 정상인 것 위주로)
+    channel_profile: Optional[Dict[str, Any]] = None
+    if req.make_channel_profile:
+        # 영상 분석이 JSON으로 성공한 것만 모으기
+        analyses: List[Dict[str, Any]] = []
+        for v in videos:
+            if not v.get("ok"):
+                continue
+            va = v.get("videoAnalysis")
+            if isinstance(va, dict) and va.get("ok") is False:
+                continue
+            analyses.append({
+                "index": v.get("index"),
+                "url": v.get("url"),
+                "meta": v.get("meta"),
+                "analysis": va,
+            })
+
+        if analyses:
+            prompt = build_channel_profile_prompt(analyses)
+            channel_profile = analyze_with_gemini(prompt, max_output_tokens=2048)
+        else:
+            channel_profile = {
+                "ok": False,
+                "error": "No valid per-video analyses to build channel profile"
+            }
+
+    warnings = _build_warnings(videos)
+
+    return {
+        "ok": True,
+        "count": len(videos),
+        "videos": videos,
+        "channelProfile": channel_profile,
+        "warnings": warnings,
+    }
+
+# 과거 n8n이 /analyze를 치던 호환용
+@app.post("/analyze")
+async def analyze(req: AnalyzeReq) -> Dict[str, Any]:
+    return await analyze_and_profile(req)
