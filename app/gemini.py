@@ -4,45 +4,61 @@ from __future__ import annotations
 import os
 import json
 from typing import Dict, Any
+import httpx
 
-from google import genai
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()  # 우선 flash 추천
+GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "60"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Gemini API REST endpoint (API Key 방식)
+# model 예: gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro 등
+BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def analyze_with_gemini(prompt: str, max_output_tokens: int = 2048) -> Dict[str, Any]:
-    """
-    google-genai 버전 차이로 generation_config 인자가 없을 수 있음.
-    => 가장 호환성 높은 방식: 최소 인자만으로 호출하고,
-       JSON 파싱 실패 시 ok:false로 반환.
-    """
     if not GEMINI_API_KEY:
         return {"ok": False, "error": "GEMINI_API_KEY is missing"}
 
-    try:
-        # ✅ 여기서 generation_config를 넘기지 않는다 (버전 호환)
-        resp = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        text = (getattr(resp, "text", None) or "").strip()
+    url = f"{BASE_URL}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-        if not text:
-            return {"ok": False, "error": "Empty Gemini response"}
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": max_output_tokens,
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=GEMINI_TIMEOUT_SEC) as client:
+            r = client.post(url, json=payload)
+            if r.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"Gemini HTTP {r.status_code}",
+                    "detail": (r.text or "")[:2000],
+                }
+
+            data = r.json()
+
+        # 응답 텍스트 꺼내기
+        # candidates[0].content.parts[0].text
+        text = ""
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            return {"ok": False, "error": "Gemini response missing text", "raw": data}
 
         # JSON 강제 파싱
         try:
             return json.loads(text)
         except Exception:
-            # JSON이 아닐 때 운영을 위해 raw를 남김
-            return {
-                "ok": False,
-                "error": "Gemini output not valid JSON",
-                "raw": text[:4000],
-            }
+            return {"ok": False, "error": "Gemini output not valid JSON", "raw": text[:4000]}
 
     except Exception as e:
         return {"ok": False, "error": f"Gemini call failed: {type(e).__name__}: {str(e)[:300]}"}
