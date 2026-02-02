@@ -2,86 +2,84 @@
 from __future__ import annotations
 
 import os
+import json
+import asyncio
 from typing import Any, Dict, Optional
 
-import httpx
-import google.auth
-from google.auth.transport.requests import Request
+from google import genai
 
 
-class GeminiError(Exception):
-    pass
+def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return v
 
 
-def _get_access_token() -> str:
+def _make_client() -> genai.Client:
     """
-    Cloud Run에 붙은 서비스 계정(ADC)으로 OAuth2 access token 발급.
+    1) GEMINI_API_KEY가 있으면 -> AI Studio(API Key) 모드
+    2) 없으면 -> Vertex AI(Cloud Run 서비스계정 ADC/OAuth) 모드
     """
-    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    creds.refresh(Request())
-    if not creds.token:
-        raise GeminiError("Failed to obtain access token via ADC")
-    return creds.token
+    api_key = _get_env("GEMINI_API_KEY")
+    model = _get_env("GEMINI_MODEL", "gemini-2.5-pro")  # 참고용
+
+    if api_key:
+        # ✅ AI Studio API Key 모드: project 필요 없음
+        return genai.Client(api_key=api_key)
+
+    # ✅ Vertex AI 모드: Cloud Run 서비스계정(ADC) 사용
+    project = (
+        _get_env("GOOGLE_CLOUD_PROJECT")
+        or _get_env("GCP_PROJECT")
+        or _get_env("PROJECT_ID")
+    )
+    if not project:
+        raise RuntimeError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT/PROJECT_ID) env var")
+
+    location = _get_env("GCP_LOCATION", "us-central1")
+    # Vertex AI로 붙일 때는 vertexai=True + project/location이 필요
+    return genai.Client(vertexai=True, project=project, location=location)
 
 
-def analyze_with_gemini(
-    prompt: str,
-    *,
-    model: Optional[str] = None,
-    location: Optional[str] = None,
-    max_output_tokens: int = 2048,
-    temperature: float = 0.6,
-) -> Dict[str, Any]:
+# 모듈 로드 시 1회 생성 (요청마다 생성하면 느려짐)
+_CLIENT = _make_client()
+
+
+def _generate_sync(prompt: str, *, max_output_tokens: int = 2048) -> Dict[str, Any]:
     """
-    Vertex AI Gemini REST 호출:
-    POST https://{location}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{location}/publishers/google/models/{model}:generateContent
+    google-genai는 기본적으로 동기 호출이 많아서,
+    async 환경(FastAPI)에서 병렬 처리를 위해 to_thread로 감싸서 사용.
     """
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID")
-    if not project_id:
-        raise GeminiError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT/PROJECT_ID) env var")
+    model = _get_env("GEMINI_MODEL", "gemini-2.5-pro")
 
-    location = location or os.getenv("VERTEX_LOCATION", "us-central1")
-    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-
-    token = _get_access_token()
-    url = (
-        f"https://{location}-aiplatform.googleapis.com/v1/"
-        f"projects/{project_id}/locations/{location}/publishers/google/models/{model}:generateContent"
+    # genai 라이브러리 버전에 따라 config 파라미터 이름이 조금씩 달라서
+    # 가장 호환 잘 되는 형태로 최소만 넣는다.
+    resp = _CLIENT.models.generate_content(
+        model=model,
+        contents=prompt,
     )
 
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            "maxOutputTokens": int(max_output_tokens),
-            "temperature": float(temperature),
-        },
-    }
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
+    # resp는 라이브러리 객체일 수 있으니 dict로 안전 변환
     try:
-        with httpx.Client(timeout=120) as client:
-            r = client.post(url, json=payload, headers=headers)
-    except Exception as e:
-        raise GeminiError(f"Gemini request failed: {e}")
-
-    if r.status_code >= 400:
-        raise GeminiError(f"Gemini HTTP {r.status_code}: {r.text}")
-
-    data = r.json()
-
-    # Vertex 응답 파싱(가장 흔한 candidates[0].content.parts[0].text)
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return {"ok": True, "text": text, "raw": data}
+        # 최신 버전에서 응답 객체에 model_dump_json 같은 게 있을 수 있음
+        if hasattr(resp, "model_dump"):
+            return resp.model_dump()
+        if hasattr(resp, "to_dict"):
+            return resp.to_dict()
     except Exception:
-        # 모델이 JSON만 주거나, 다른 포맷이면 raw를 그대로 넘겨서 main에서 처리하게
-        return {"ok": True, "text": None, "raw": data}
+        pass
+
+    # 최후의 수단: 문자열/객체 그대로 감싸서 반환
+    return {"ok": True, "raw": str(resp)}
+
+
+async def analyze_with_gemini(prompt: str, *, max_output_tokens: int = 2048) -> Dict[str, Any]:
+    """
+    ✅ main.py에서 `await analyze_with_gemini(...)` 해도 안 터지게 만든 핵심.
+    """
+    try:
+        result = await asyncio.to_thread(_generate_sync, prompt, max_output_tokens=max_output_tokens)
+        return result
+    except Exception as e:
+        return {"ok": False, "error": f"Gemini call failed: {type(e).__name__}: {str(e)}"}
