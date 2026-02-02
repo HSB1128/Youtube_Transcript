@@ -1,65 +1,87 @@
+# app/gemini_rest.py
 from __future__ import annotations
 
 import os
 from typing import Any, Dict, Optional
+
 import httpx
+import google.auth
+from google.auth.transport.requests import Request
 
 
 class GeminiError(Exception):
     pass
 
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip()
+def _get_access_token() -> str:
+    """
+    Cloud Run에 붙은 서비스 계정(ADC)으로 OAuth2 access token 발급.
+    """
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    creds.refresh(Request())
+    if not creds.token:
+        raise GeminiError("Failed to obtain access token via ADC")
+    return creds.token
 
 
-async def analyze_with_gemini(
+def analyze_with_gemini(
     prompt: str,
     *,
     model: Optional[str] = None,
+    location: Optional[str] = None,
     max_output_tokens: int = 2048,
-    temperature: float = 0.2,
-    timeout_sec: float = 120.0,
+    temperature: float = 0.6,
 ) -> Dict[str, Any]:
-    if not GEMINI_API_KEY:
-        raise GeminiError("GEMINI_API_KEY is missing")
+    """
+    Vertex AI Gemini REST 호출:
+    POST https://{location}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{location}/publishers/google/models/{model}:generateContent
+    """
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID")
+    if not project_id:
+        raise GeminiError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT/PROJECT_ID) env var")
 
-    use_model = (model or GEMINI_MODEL).strip()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{use_model}:generateContent"
+    location = location or os.getenv("VERTEX_LOCATION", "us-central1")
+    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json",
-    }
+    token = _get_access_token()
+    url = (
+        f"https://{location}-aiplatform.googleapis.com/v1/"
+        f"projects/{project_id}/locations/{location}/publishers/google/models/{model}:generateContent"
+    )
 
-    body = {
+    payload = {
         "contents": [
-            {"parts": [{"text": prompt}]}
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
         ],
         "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_output_tokens,
+            "maxOutputTokens": int(max_output_tokens),
+            "temperature": float(temperature),
         },
     }
 
-    async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        r = await client.post(url, headers=headers, json=body)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=120) as client:
+            r = client.post(url, json=payload, headers=headers)
+    except Exception as e:
+        raise GeminiError(f"Gemini request failed: {e}")
 
     if r.status_code >= 400:
-        # 그대로 반환해서 디버깅 가능하게
         raise GeminiError(f"Gemini HTTP {r.status_code}: {r.text}")
 
     data = r.json()
 
-    # 텍스트 뽑기 (후처리에서 쓰기 쉽도록 text도 같이 넣어줌)
-    text = ""
+    # Vertex 응답 파싱(가장 흔한 candidates[0].content.parts[0].text)
     try:
-        cands = data.get("candidates") or []
-        if cands:
-            parts = cands[0].get("content", {}).get("parts", [])
-            if parts and isinstance(parts[0], dict):
-                text = parts[0].get("text", "") or ""
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return {"ok": True, "text": text, "raw": data}
     except Exception:
-        text = ""
-
-    return {"ok": True, "model": use_model, "text": text, "raw": data}
+        # 모델이 JSON만 주거나, 다른 포맷이면 raw를 그대로 넘겨서 main에서 처리하게
+        return {"ok": True, "text": None, "raw": data}
