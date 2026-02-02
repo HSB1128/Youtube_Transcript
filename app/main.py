@@ -1,25 +1,24 @@
-# app/main.py
 from __future__ import annotations
 
 import os
 import json
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.apify_client import fetch_transcript_and_metadata, ApifyError
-from app.gemini_rest import analyze_with_gemini
+from app.gemini_rest import analyze_with_gemini, GeminiError
 from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt
 from app.utils import normalize_urls, pick_language_priority, compact_text, segments_to_text
-
 
 app = FastAPI(title="YouTube Transcript + Channel Profile (Apify + Gemini)")
 
 DEFAULT_CONCURRENCY = int(os.getenv("CONCURRENCY", "4"))
 APIFY_TIMEOUT_SEC = float(os.getenv("APIFY_TIMEOUT_SEC", "120"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "18000"))
+APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
 
 
 class AnalyzeReq(BaseModel):
@@ -35,45 +34,41 @@ def health():
 
 
 def _parse_body_allow_string_json(body: Any) -> Dict[str, Any]:
-    """
-    n8n Raw에서 JSON.stringify(...) 쓰면 body가 str로 들어오는 경우가 있음.
-    """
     if isinstance(body, str):
         try:
             body = json.loads(body)
         except Exception:
             raise HTTPException(400, "Body was a string but not valid JSON")
-
     if not isinstance(body, dict):
         raise HTTPException(400, "Body must be a JSON object")
-
     return body
 
 
 async def _process_one(
     idx: int,
     url: str,
-    sem: asyncio.Semaphore,
     lang_priority: List[str],
+    sem: asyncio.Semaphore,
 ) -> Dict[str, Any]:
     async with sem:
+        # 1) Apify (언어 우선순위대로 시도)
         apify_data: Optional[Dict[str, Any]] = None
         apify_error: Optional[str] = None
-        used_lang: Optional[str] = None
 
-        # 언어 우선순위대로 시도
         for lang in lang_priority:
             try:
                 apify_data = await fetch_transcript_and_metadata(
                     youtube_url=url,
                     language=lang,
                     timeout_sec=APIFY_TIMEOUT_SEC,
-                    include_transcript_text=True,
+                    token=APIFY_TOKEN,
+                    actor_id="starvibe~youtube-video-transcript",
                 )
-                used_lang = lang
+                apify_error = None
                 break
-            except (ApifyError, Exception) as e:
+            except Exception as e:
                 apify_error = str(e)
+                apify_data = None
 
         if not apify_data:
             return {
@@ -84,16 +79,12 @@ async def _process_one(
                 "error": apify_error or "Apify failed",
             }
 
-        # transcript_text 우선 사용
+        # 2) transcript_text 우선, 없으면 segments join
         transcript_text = apify_data.get("transcript_text") or ""
         transcript_text = compact_text(transcript_text, max_chars=MAX_TRANSCRIPT_CHARS)
 
-        # 없으면 transcript segments join
         if not transcript_text:
-            transcript_text = segments_to_text(
-                apify_data.get("transcript"),
-                max_chars=MAX_TRANSCRIPT_CHARS,
-            )
+            transcript_text = segments_to_text(apify_data.get("transcript"), max_chars=MAX_TRANSCRIPT_CHARS)
 
         if not transcript_text:
             return {
@@ -105,35 +96,40 @@ async def _process_one(
                     "title": apify_data.get("title", ""),
                     "channel": apify_data.get("channel_name", ""),
                     "published_at": apify_data.get("published_at", ""),
-                    "language": apify_data.get("language") or used_lang,
+                    "language": apify_data.get("language"),
                 },
                 "error": "NO_TRANSCRIPT_RETURNED_BY_APIFY",
             }
 
-        prompt = build_video_analysis_prompt(
-            index=idx,
-            title=apify_data.get("title", ""),
-            description=(apify_data.get("description", "") or "")[:300],
-            transcript_text=transcript_text,
-        )
+        meta = {
+            "title": apify_data.get("title", ""),
+            "description": apify_data.get("description", ""),
+            "channel": apify_data.get("channel_name", ""),
+            "published_at": apify_data.get("published_at", ""),
+            "duration_seconds": apify_data.get("duration_seconds"),
+            "view_count": apify_data.get("view_count"),
+            "like_count": apify_data.get("like_count"),
+            "comment_count": apify_data.get("comment_count"),
+            "language": apify_data.get("language"),
+        }
 
-        analysis = analyze_with_gemini(prompt, max_output_tokens=2048)
+        # 3) Gemini 영상별 분석
+        try:
+            prompt = build_video_analysis_prompt(
+                index=idx,
+                title=meta.get("title", ""),
+                description=(meta.get("description", "") or "")[:300],
+                transcript_text=transcript_text,
+            )
+            analysis = await analyze_with_gemini(prompt, max_output_tokens=2048)
+        except Exception as e:
+            analysis = {"ok": False, "error": str(e)}
 
         return {
             "index": idx,
             "url": url,
-            "ok": True,
-            "meta": {
-                "title": apify_data.get("title", ""),
-                "description": apify_data.get("description", ""),
-                "channel": apify_data.get("channel_name", ""),
-                "published_at": apify_data.get("published_at", ""),
-                "duration_seconds": apify_data.get("duration_seconds"),
-                "view_count": apify_data.get("view_count"),
-                "like_count": apify_data.get("like_count"),
-                "comment_count": apify_data.get("comment_count"),
-                "language": apify_data.get("language") or used_lang,
-            },
+            "ok": True,  # Apify/transcript는 성공했으니 True 유지
+            "meta": meta,
             "transcript_chars": len(transcript_text),
             "videoAnalysis": analysis,
         }
@@ -143,26 +139,22 @@ def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     warns: List[Dict[str, Any]] = []
     for v in videos:
         if not v.get("ok"):
-            warns.append(
-                {
-                    "index": v.get("index"),
-                    "url": v.get("url"),
-                    "stage": v.get("stage"),
-                    "error": v.get("error"),
-                }
-            )
+            warns.append({
+                "index": v.get("index"),
+                "url": v.get("url"),
+                "stage": v.get("stage"),
+                "error": v.get("error"),
+            })
             continue
 
         va = v.get("videoAnalysis") or {}
-        if isinstance(va, dict) and va.get("ok") is False and va.get("error"):
-            warns.append(
-                {
-                    "index": v.get("index"),
-                    "url": v.get("url"),
-                    "stage": "gemini_video_analysis",
-                    "error": va.get("error"),
-                }
-            )
+        if isinstance(va, dict) and va.get("ok") is False:
+            warns.append({
+                "index": v.get("index"),
+                "url": v.get("url"),
+                "stage": "gemini_video_analysis",
+                "error": va.get("error"),
+            })
     return warns
 
 
@@ -172,15 +164,15 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
         raise HTTPException(400, "urls is empty")
 
     lang_priority = pick_language_priority(req.languages)
-
     sem = asyncio.Semaphore(req.concurrency)
 
     tasks = [
-        _process_one(i + 1, u, sem, lang_priority)
+        _process_one(i + 1, u, lang_priority, sem)
         for i, u in enumerate(urls)
     ]
     videos = await asyncio.gather(*tasks)
 
+    # 채널 프로필 (Gemini 영상 분석이 ok=true인 것만 모아서)
     channel_profile: Optional[Dict[str, Any]] = None
     if req.make_channel_profile:
         analyses: List[Dict[str, Any]] = []
@@ -188,25 +180,23 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
             if not v.get("ok"):
                 continue
             va = v.get("videoAnalysis")
-            if isinstance(va, dict) and va.get("ok") is False:
+            if not isinstance(va, dict) or va.get("ok") is False:
                 continue
-            analyses.append(
-                {
-                    "index": v.get("index"),
-                    "url": v.get("url"),
-                    "meta": v.get("meta"),
-                    "analysis": va,
-                }
-            )
+            analyses.append({
+                "index": v.get("index"),
+                "url": v.get("url"),
+                "meta": v.get("meta"),
+                "analysis": va.get("text") or va,
+            })
 
         if analyses:
-            prompt = build_channel_profile_prompt(analyses)
-            channel_profile = analyze_with_gemini(prompt, max_output_tokens=2048)
+            try:
+                prompt = build_channel_profile_prompt(analyses)
+                channel_profile = await analyze_with_gemini(prompt, max_output_tokens=2048)
+            except Exception as e:
+                channel_profile = {"ok": False, "error": str(e)}
         else:
-            channel_profile = {
-                "ok": False,
-                "error": "No valid per-video analyses to build channel profile",
-            }
+            channel_profile = {"ok": False, "error": "No valid per-video analyses to build channel profile"}
 
     warnings = _build_warnings(videos)
 
@@ -228,7 +218,8 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
 
     body = _parse_body_allow_string_json(body)
 
-    # n8n 호환: languages_priority -> languages
+    # 호환: urls가 문자열로 오면 split을 normalize_urls가 처리함
+    # 호환: languages_priority -> languages
     if "languages_priority" in body and "languages" not in body:
         body["languages"] = body.get("languages_priority")
 
@@ -240,7 +231,7 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
     return await _analyze_impl(req)
 
 
-# n8n 호환: 예전 노드가 /analyze 로 치는 경우
+# n8n 호환: /analyze 로 보내도 동일 처리
 @app.post("/analyze")
 async def analyze(request: Request) -> Dict[str, Any]:
     return await analyze_and_profile(request)
