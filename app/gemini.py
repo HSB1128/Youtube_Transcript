@@ -1,27 +1,35 @@
-# app/gemini.py
 from __future__ import annotations
-
 import os
 import json
-from typing import Dict, Any
+from typing import Any, Dict
 import httpx
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()  # 우선 flash 추천
-GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "60"))
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.5-pro").strip()
 
-# Gemini API REST endpoint (API Key 방식)
-# model 예: gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro 등
+# Gemini API (AI Studio) generateContent endpoint
+# 문서: generativelanguage.googleapis.com 기반 :contentReference[oaicite:7]{index=7}
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+class GeminiError(Exception):
+    pass
 
-def analyze_with_gemini(prompt: str, max_output_tokens: int = 2048) -> Dict[str, Any]:
+def _safe_json_loads(text: str) -> Any:
+    t = (text or "").strip()
+    if not t:
+        return None
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
+
+async def analyze_with_gemini(prompt: str, max_output_tokens: int = 2048) -> Dict[str, Any]:
     if not GEMINI_API_KEY:
         return {"ok": False, "error": "GEMINI_API_KEY is missing"}
 
-    url = f"{BASE_URL}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"{BASE_URL}/models/{GEMINI_MODEL}:generateContent"
 
-    payload = {
+    body = {
         "contents": [
             {
                 "role": "user",
@@ -31,34 +39,33 @@ def analyze_with_gemini(prompt: str, max_output_tokens: int = 2048) -> Dict[str,
         "generationConfig": {
             "temperature": 0.3,
             "maxOutputTokens": max_output_tokens,
-        },
+        }
     }
 
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
+        r = await client.post(url, headers=headers, json=body)
+
+    if r.status_code == 401:
+        # 너가 지금 보는 그 에러. (대부분 endpoint/인증모드 mismatch 케이스) :contentReference[oaicite:8]{index=8}
+        return {"ok": False, "error": "Gemini HTTP 401", "detail": r.text[:2000]}
+    if r.status_code >= 400:
+        return {"ok": False, "error": f"Gemini HTTP {r.status_code}", "detail": r.text[:2000]}
+
+    data = r.json()
+
+    # 응답 텍스트 꺼내기 (candidate[0].content.parts[0].text)
     try:
-        with httpx.Client(timeout=GEMINI_TIMEOUT_SEC) as client:
-            r = client.post(url, json=payload)
-            if r.status_code != 200:
-                return {
-                    "ok": False,
-                    "error": f"Gemini HTTP {r.status_code}",
-                    "detail": (r.text or "")[:2000],
-                }
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return {"ok": False, "error": "Gemini response parse failed", "raw": data}
 
-            data = r.json()
-
-        # 응답 텍스트 꺼내기
-        # candidates[0].content.parts[0].text
-        text = ""
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
-            return {"ok": False, "error": "Gemini response missing text", "raw": data}
-
-        # JSON 강제 파싱
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"ok": False, "error": "Gemini output not valid JSON", "raw": text[:4000]}
-
-    except Exception as e:
-        return {"ok": False, "error": f"Gemini call failed: {type(e).__name__}: {str(e)[:300]}"}
+    # “반드시 JSON만 출력” 프롬프트라서 json.loads 시도
+    parsed = _safe_json_loads(text)
+    if parsed is None:
+        return {"ok": False, "error": "Gemini output not valid JSON", "raw": text[:2000]}
+    return parsed
