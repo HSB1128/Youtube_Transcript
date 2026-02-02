@@ -1,80 +1,75 @@
-# app/apify_client.py
 from __future__ import annotations
-
 import os
 from typing import Any, Dict, Optional
 import httpx
 
-APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "starvibe~youtube-video-transcript").strip()
-
-# Apify run-sync-get-dataset-items endpoint
-APIFY_BASE = "https://api.apify.com"
-
-class ApifyError(RuntimeError):
+class ApifyError(Exception):
     pass
 
-async def fetch_transcript_and_metadata(
-    client: httpx.AsyncClient,
-    youtube_url: str,
-    language: Optional[str] = None,
-    timeout_sec: float = 120.0,
-) -> Dict[str, Any]:
-    """
-    Apify Actor 실행(동기) -> dataset items 받기.
-    반환은 actor output item 1개(보통 1개) 기준으로 정리해서 리턴.
+APIFY_TOKEN = (os.getenv("APIFY_TOKEN") or "").strip()
+APIFY_TIMEOUT_SEC = float(os.getenv("APIFY_TIMEOUT_SEC", "120"))
 
-    참고: run-sync-get-dataset-items는 Actor 실행이 끝나야 응답이 오며,
-    오래 걸리면 HTTP가 timeout 될 수 있음. (run은 계속 돌 수 있음)
-    """
+# starvibe/youtube-video-transcript
+# run-sync-get-dataset-items는 실행 완료까지 기다렸다가 dataset items를 바로 응답으로 줌.
+APIFY_ACTOR_RUN_SYNC_DATASET_ITEMS = (
+    "https://api.apify.com/v2/acts/starvibe~youtube-video-transcript/"
+    "run-sync-get-dataset-items"
+)
+
+async def fetch_transcript_and_metadata(
+    youtube_url: str,
+    language: str,
+    timeout_sec: float = APIFY_TIMEOUT_SEC,
+) -> Dict[str, Any]:
     if not APIFY_TOKEN:
         raise ApifyError("APIFY_TOKEN is missing")
 
-    url = f"{APIFY_BASE}/v2/acts/{APIFY_ACTOR_ID}/run-sync-get-dataset-items"
-    params = {"token": APIFY_TOKEN}
-
-    # Actor input schema에 맞춰 최소 필드만 구성
-    payload: Dict[str, Any] = {
-        "youtube_url": youtube_url,
-        "include_transcript_text": True,  # Gemini에 넣기 좋은 transcript_text 우선
+    payload = {
+        # 입력 스키마는 Apify actor 문서 기준 (youtubeUrl, language, includeTranscriptText 등)
+        "youtubeUrl": youtube_url,
+        "language": language,
+        "includeTranscriptText": True,
     }
-    if language:
-        payload["language"] = language
 
-    try:
-        r = await client.post(url, params=params, json=payload, timeout=timeout_sec)
-        r.raise_for_status()
-        items = r.json()
-    except httpx.HTTPStatusError as e:
-        raise ApifyError(f"Apify HTTP error: {e.response.status_code} {e.response.text[:500]}")
-    except Exception as e:
-        raise ApifyError(f"Apify request failed: {str(e)}")
+    params = {
+        "token": APIFY_TOKEN,
+        "format": "json",
+        # actor에 따라 timeout이 길어질 수 있어서 http client timeout을 넉넉히
+    }
 
-    if not isinstance(items, list) or len(items) == 0:
-        # actor가 dataset에 아무것도 안 쌓았거나 형식이 다를 때
-        raise ApifyError("Apify returned empty dataset items")
+    timeout = httpx.Timeout(timeout_sec, connect=20.0)
 
-    # 보통 1개 아이템이 온다고 가정
-    it = items[0]
-    if not isinstance(it, dict):
-        raise ApifyError("Apify item is not an object")
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(APIFY_ACTOR_RUN_SYNC_DATASET_ITEMS, params=params, json=payload)
+        if r.status_code >= 400:
+            raise ApifyError(f"Apify HTTP {r.status_code}: {r.text[:1000]}")
 
-    # Apify output-schema의 키들은 actor 버전에 따라 조금씩 다를 수 있으니
-    # 원본을 그대로 meta로 남기고, 우리가 쓰는 필드만 추출해서 붙임.
+        data = r.json()
+
+    # dataset items 형태는 보통 배열. (아이템 1개만 온다고 가정하고 첫번째 사용)
+    if isinstance(data, list) and data:
+        item = data[0]
+    elif isinstance(data, dict):
+        item = data
+    else:
+        item = {}
+
+    # 통일된 키로 정리해서 리턴
+    # (actor output 스키마에 따라 필드명 약간 다를 수 있어서 여러 후보를 같이 체크)
     out: Dict[str, Any] = {
-        "ok": True,
-        "url": youtube_url,
-        "apify_raw": it,
-        "title": it.get("title") or "",
-        "description": it.get("description") or "",
-        "channel_name": it.get("channel_name") or it.get("channelTitle") or "",
-        "published_at": it.get("published_at") or it.get("publishedAt") or "",
-        "duration_seconds": it.get("duration_seconds") or it.get("durationSec") or None,
-        "view_count": it.get("view_count") or None,
-        "like_count": it.get("like_count") or None,
-        "comment_count": it.get("comment_count") or None,
-        "transcript_text": it.get("transcript_text") or "",
-        "transcript": it.get("transcript") or [],
-        "language": it.get("language") or language,
+        "title": item.get("title") or item.get("videoTitle") or "",
+        "description": item.get("description") or item.get("videoDescription") or "",
+        "channel_name": item.get("channelName") or item.get("channel") or "",
+        "published_at": item.get("publishedAt") or item.get("published_at") or "",
+        "duration_seconds": item.get("durationSeconds") or item.get("duration") or None,
+        "view_count": item.get("viewCount") or None,
+        "like_count": item.get("likeCount") or None,
+        "comment_count": item.get("commentCount") or None,
+        "language": item.get("language") or language,
+        # transcript_text 우선
+        "transcript_text": item.get("transcriptText") or item.get("transcript_text") or "",
+        # segments 형태도 혹시 있으니 같이 보관
+        "transcript": item.get("transcript") or item.get("segments") or None,
+        "raw": item,
     }
     return out
