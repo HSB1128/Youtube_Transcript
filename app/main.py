@@ -13,12 +13,7 @@ import httpx
 from app.apify_client import fetch_transcript_and_metadata, ApifyError
 from app.gemini import analyze_with_gemini
 from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt
-from app.utils import (
-    normalize_urls,
-    pick_language_priority,
-    compact_text,
-    segments_to_text,
-)
+from app.utils import normalize_urls, pick_language_priority, compact_text, segments_to_text
 
 app = FastAPI(title="YouTube Transcript + Channel Profile (Apify + Gemini)")
 
@@ -48,9 +43,9 @@ async def _process_one(
 ) -> Dict[str, Any]:
     """
     영상 1개 처리:
-    1) Apify로 메타+자막 수집
-    2) transcript_text(우선) 또는 transcript segments(join)로 텍스트 구성
-    3) Gemini로 영상별 기획요약(JSON) 추출
+      1) Apify로 메타+자막 수집
+      2) transcript_text 우선, 없으면 transcript segments join
+      3) Gemini로 영상별 기획요약(JSON) 추출
     """
     async with sem:
         apify_data: Optional[Dict[str, Any]] = None
@@ -216,9 +211,7 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
 
 def _parse_body_allow_string_json(body: Any) -> Dict[str, Any]:
     """
-    n8n Raw + JSON.stringify(...) 를 쓰면,
-    request.json() 결과가 str 로 들어오는 경우가 생김.
-    그걸 dict로 한 번 더 파싱해준다.
+    n8n Raw + JSON.stringify(...) 사용 시 body가 str로 들어올 수 있음.
     """
     if isinstance(body, str):
         try:
@@ -239,7 +232,7 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
 
     body = _parse_body_allow_string_json(body)
 
-    # 호환: 예전 n8n이 languages_priority로 보내던 경우 자동 매핑
+    # 호환: 예전 n8n이 languages_priority로 보내던 경우
     if "languages_priority" in body and "languages" not in body:
         body["languages"] = body.get("languages_priority")
 
@@ -251,7 +244,7 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
     return await _analyze_impl(req)
 
 
-# n8n 호환: /analyze 로 보내도 동일 처리
 @app.post("/analyze")
 async def analyze(request: Request) -> Dict[str, Any]:
+    # /analyze도 동일 로직으로 처리 (n8n 호환)
     return await analyze_and_profile(request)
