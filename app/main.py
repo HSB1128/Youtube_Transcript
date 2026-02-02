@@ -121,7 +121,7 @@ async def _process_one(
                 description=(meta.get("description", "") or "")[:300],
                 transcript_text=transcript_text,
             )
-            analysis = await analyze_with_gemini(prompt, max_output_tokens=2048)
+            analysis = analyze_with_gemini(prompt, max_output_tokens=2048)
         except Exception as e:
             analysis = {"ok": False, "error": str(e)}
 
