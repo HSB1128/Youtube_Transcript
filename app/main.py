@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.apify_client import fetch_transcript_and_metadata, ApifyError
-from app.gemini_rest import analyze_with_gemini, GeminiError
+from app.gemini_rest import analyze_with_gemini
 from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt
 from app.utils import normalize_urls, pick_language_priority, compact_text, segments_to_text
 
