@@ -1,170 +1,137 @@
 # app/main.py
+from __future__ import annotations
+
+import os, asyncio
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
-import os
+import httpx
 
-from app.youtube_data import fetch_videos_metadata
-from app.transcript import fetch_best_transcript
-from app.stt import stt_from_youtube_url
+from app.apify_client import fetch_transcript_and_metadata, ApifyError
+from app.gemini import analyze_with_gemini
+from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt
+from app.utils import normalize_urls, pick_language_priority, compact_text, segments_to_text
 
-app = FastAPI(title="YouTube Transcription (captions first)")
+app = FastAPI(title="YouTube Transcript + Channel Profile (Apify + Gemini)")
 
-# ====== 환경변수 ======
-MAX_DURATION_SEC_FOR_STT = int(os.getenv("MAX_DURATION_SEC_FOR_STT", "1200"))
-ENABLE_STT = os.getenv("ENABLE_STT", "true").lower() == "true"
-
+DEFAULT_CONCURRENCY = int(os.getenv("CONCURRENCY", "4"))
+APIFY_TIMEOUT_SEC = float(os.getenv("APIFY_TIMEOUT_SEC", "120"))  # 영상 1개당 Apify 대기 시간
+MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "18000"))  # Gemini 입력 보호
 
 class AnalyzeReq(BaseModel):
     urls: List[str] = Field(..., description="YouTube URLs")
     languages: List[str] = Field(default_factory=lambda: ["ko", "en"])
-    include_stats: bool = True
-    stt_fallback: bool = True
-    skip_stt_if_longer_than_sec: int = Field(default=MAX_DURATION_SEC_FOR_STT)
-
+    concurrency: int = Field(default=DEFAULT_CONCURRENCY, ge=1, le=20)
+    make_channel_profile: bool = True
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+async def _process_one(
+    idx: int,
+    url: str,
+    lang_priority: List[str],
+    sem: asyncio.Semaphore,
+    client: httpx.AsyncClient,
+) -> Dict[str, Any]:
+    """
+    영상 1개 처리:
+    - Apify로 메타+자막
+    - transcript_text 만들어서 Gemini로 영상별 분석 JSON
+    """
+    async with sem:
+        # 1) Apify 호출 (언어 우선순위 순서대로 한 번씩만 시도)
+        apify_data: Optional[Dict[str, Any]] = None
+        apify_error: Optional[str] = None
 
-def _confidence_from_source(source_type: str) -> str:
-    if source_type == "MANUAL":
-        return "high"
-    if source_type in ("AUTO", "TRANSLATED", "FETCH", "STT"):
-        # AUTO/TRANSLATED는 품질 편차가 있으니 기본 medium (정교 평가는 Gemini가)
-        return "medium"
-    return "low"
+        for lang in lang_priority:
+            try:
+                apify_data = await fetch_transcript_and_metadata(
+                    client=client,
+                    youtube_url=url,
+                    language=lang,
+                    timeout_sec=APIFY_TIMEOUT_SEC,
+                )
+                apify_error = None
+                break
+            except ApifyError as e:
+                apify_error = str(e)
+                continue
 
-
-def _expand_language_variants(langs: List[str]) -> List[str]:
-    # ko -> ko-KR, en -> en-US/en-GB 변형 추가 (요구사항 반영)
-    variants: List[str] = []
-    for lang in (langs or []):
-        l = (lang or "").strip()
-        if not l:
-            continue
-        variants.append(l)
-        if l == "ko":
-            variants += ["ko-KR"]
-        elif l == "en":
-            variants += ["en-US", "en-GB"]
-
-    # dedupe keeping order
-    seen = set()
-    out = []
-    for v in variants:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-
-def _run(req: AnalyzeReq) -> Dict[str, Any]:
-    if not req.urls:
-        raise HTTPException(400, "urls is empty")
-
-    meta = fetch_videos_metadata(req.urls, include_stats=req.include_stats)
-
-    per_video: List[Dict[str, Any]] = []
-    warnings: List[Dict[str, Any]] = []
-
-    languages_priority = _expand_language_variants(req.languages)
-
-    for item in meta.get("items", []):
-        # meta fetch 실패
-        if not item.get("ok"):
-            out = {
-                "index": len(per_video) + 1,
-                "url": item.get("url"),
-                "videoId": item.get("videoId"),
+        if not apify_data:
+            return {
+                "index": idx,
+                "url": url,
                 "ok": False,
-                "meta": item,
-                "transcriptSource": "NONE",
-                "transcriptInfo": {"sourceType": "NONE", "language": None, "languageCode": None, "isGenerated": None, "detail": {"error": "META_FAILED"}},
-                "sttUsed": False,
-                "sttInfo": None,
-                "confidence": "low",
-                "needsTranscript": True,
-                "segments": [],
+                "stage": "apify",
+                "error": apify_error or "Apify failed",
             }
-            per_video.append(out)
-            warnings.append({"index": out["index"], "url": out["url"], "reason": "META_FAILED"})
-            continue
 
-        url = item["url"]
-        video_id = item["videoId"]
-        duration_sec = int(item.get("durationSec") or 0)
+        # 2) transcript_text 우선, 없으면 transcript segments join
+        transcript_text = apify_data.get("transcript_text") or ""
+        transcript_text = compact_text(transcript_text, max_chars=MAX_TRANSCRIPT_CHARS)
 
-        # 1) 자막(수동/자동/번역) 최대한 시도
-        ti = fetch_best_transcript(video_id, languages_priority=languages_priority)
-        segs = ti.get("segments", []) if ti.get("ok") else []
-        transcript_source = ti.get("sourceType", "NONE")
+        if not transcript_text:
+            transcript_text = segments_to_text(apify_data.get("transcript"), max_chars=MAX_TRANSCRIPT_CHARS)
 
-        confidence = _confidence_from_source(transcript_source)
-        needs_transcript = (len(segs) == 0)
+        if not transcript_text:
+            return {
+                "index": idx,
+                "url": url,
+                "ok": False,
+                "stage": "transcript",
+                "meta": {
+                    "title": apify_data.get("title", ""),
+                    "channel": apify_data.get("channel_name", ""),
+                    "published_at": apify_data.get("published_at", ""),
+                },
+                "error": "NO_TRANSCRIPT_RETURNED_BY_APIFY",
+            }
 
-        # 2) STT 폴백 (자막이 없을 때만)
-        stt_info: Optional[Dict[str, Any]] = None
-        stt_used = False
-        if needs_transcript and req.stt_fallback and ENABLE_STT:
-            stt_used = True
-            if duration_sec > req.skip_stt_if_longer_than_sec:
-                stt_info = {
-                    "ok": False,
-                    "skipped": True,
-                    "reason": f"durationSec {duration_sec} > skip_stt_if_longer_than_sec {req.skip_stt_if_longer_than_sec}",
-                }
-            else:
-                stt_info = stt_from_youtube_url(url)
-                if stt_info.get("ok") and stt_info.get("segments"):
-                    segs = stt_info["segments"]
-                    transcript_source = "STT"
-                    confidence = _confidence_from_source("STT")
-                    needs_transcript = False
+        # 3) Gemini 영상별 분석
+        prompt = build_video_analysis_prompt(
+            index=idx,
+            title=apify_data.get("title", ""),
+            description=apify_data.get("description", "")[:300],
+            transcript_text=transcript_text,
+        )
+        analysis = analyze_with_gemini(prompt, max_output_tokens=2048)
 
-        out = {
-            "index": len(per_video) + 1,
+        return {
+            "index": idx,
             "url": url,
-            "videoId": video_id,
             "ok": True,
-            "meta": item,
-            "transcriptSource": transcript_source,
-            "transcriptInfo": {
-                "sourceType": ti.get("sourceType", "NONE"),
-                "language": ti.get("language"),
-                "languageCode": ti.get("languageCode"),
-                "isGenerated": ti.get("isGenerated"),
-                "detail": ti.get("detail"),
+            "meta": {
+                "title": apify_data.get("title", ""),
+                "description": apify_data.get("description", ""),
+                "channel": apify_data.get("channel_name", ""),
+                "published_at": apify_data.get("published_at", ""),
+                "duration_seconds": apify_data.get("duration_seconds"),
+                "view_count": apify_data.get("view_count"),
+                "like_count": apify_data.get("like_count"),
+                "comment_count": apify_data.get("comment_count"),
+                "language": apify_data.get("language"),
             },
-            "sttUsed": stt_used,
-            "sttInfo": stt_info,
-            "confidence": confidence,
-            "needsTranscript": needs_transcript,
-            "segments": segs,
+            "transcript_chars": len(transcript_text),
+            "videoAnalysis": analysis,
         }
 
-        if needs_transcript:
-            warnings.append({
-                "index": out["index"],
-                "url": url,
-                "reason": "NO_TRANSCRIPT_AND_STT_FAILED" if stt_used else "NO_TRANSCRIPT",
-                "transcriptSource": transcript_source,
-                "transcriptInfo": out["transcriptInfo"],
-                "sttInfo": stt_info,
+def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    warns = []
+    for v in videos:
+        if not v.get("ok"):
+            warns.append({
+                "index": v.get("index"),
+                "url": v.get("url"),
+                "stage": v.get("stage"),
+                "error": v.get("error"),
             })
-
-        per_video.append(out)
-
-    return {"ok": True, "count": len(per_video), "videos": per_video, "warnings": warnings}
-
-
-@app.post("/analyze_and_profile")
-def analyze_and_profile(req: AnalyzeReq) -> Dict[str, Any]:
-    return _run(req)
-
-
-# (옵션) 과거 n8n 설정이 /analyze를 치는 경우 404 안 나게 호환
-@app.post("/analyze")
-def analyze(req: AnalyzeReq) -> Dict[str, Any]:
-    return _run(req)
+        else:
+            # Gemini JSON 실패도 경고로 올려두면 운영이 편함
+            va = v.get("videoAnalysis") or {}
+            if isinstance(va, dict) and va.get("ok") is False and va.get("error"):
+                warns.append({
+                    "index": v.get("index"),
+                    "url": v.get("url"),
+                    "stage": "gemini_video_analysi
