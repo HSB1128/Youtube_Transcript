@@ -84,7 +84,10 @@ async def _process_one(
         transcript_text = compact_text(transcript_text, max_chars=MAX_TRANSCRIPT_CHARS)
 
         if not transcript_text:
-            transcript_text = segments_to_text(apify_data.get("transcript"), max_chars=MAX_TRANSCRIPT_CHARS)
+            transcript_text = segments_to_text(
+                apify_data.get("transcript"),
+                max_chars=MAX_TRANSCRIPT_CHARS
+            )
 
         if not transcript_text:
             return {
@@ -121,7 +124,12 @@ async def _process_one(
                 description=(meta.get("description", "") or "")[:300],
                 transcript_text=transcript_text,
             )
-            analysis = analyze_with_gemini(prompt, max_output_tokens=2048)
+            # ✅ analyze_with_gemini는 sync(dict 리턴)일 가능성이 높으니 thread로 돌린다
+            analysis = await asyncio.to_thread(
+                analyze_with_gemini,
+                prompt,
+                max_output_tokens=2048
+            )
         except Exception as e:
             analysis = {"ok": False, "error": str(e)}
 
@@ -192,7 +200,12 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
         if analyses:
             try:
                 prompt = build_channel_profile_prompt(analyses)
-                channel_profile = await analyze_with_gemini(prompt, max_output_tokens=2048)
+                # ✅ 여기서 터지던 await dict 문제 해결: thread로 돌리고 await
+                channel_profile = await asyncio.to_thread(
+                    analyze_with_gemini,
+                    prompt,
+                    max_output_tokens=2048
+                )
             except Exception as e:
                 channel_profile = {"ok": False, "error": str(e)}
         else:
@@ -218,7 +231,6 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
 
     body = _parse_body_allow_string_json(body)
 
-    # 호환: urls가 문자열로 오면 split을 normalize_urls가 처리함
     # 호환: languages_priority -> languages
     if "languages_priority" in body and "languages" not in body:
         body["languages"] = body.get("languages_priority")
