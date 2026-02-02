@@ -1,49 +1,98 @@
-# app/utils.py
 from __future__ import annotations
-from typing import Any, List
+
+from typing import Any, Dict, List, Optional
+import re
 
 
-def normalize_urls(urls: List[str]) -> List[str]:
-    out = []
-    for u in urls:
-        u = (u or "").strip()
-        if not u:
+def normalize_urls(urls: Any) -> List[str]:
+    """
+    urls가 아래 형태로 올 수 있음:
+    - ["https://...","https://..."]
+    - "https://...\nhttps://...\n"
+    - " https://... , https://... "
+    """
+    if urls is None:
+        return []
+
+    if isinstance(urls, list):
+        raw = []
+        for u in urls:
+            if not u:
+                continue
+            raw.append(str(u))
+        joined = "\n".join(raw)
+    else:
+        joined = str(urls)
+
+    # 쉼표/공백/개행 혼합 대비
+    parts = re.split(r"[\s,\n]+", joined.strip())
+    cleaned = []
+    for p in parts:
+        if not p:
             continue
-        out.append(u)
+        p = p.strip()
+        if p.startswith("http://") or p.startswith("https://"):
+            cleaned.append(p)
+
     # 중복 제거(순서 유지)
     seen = set()
-    uniq = []
-    for u in out:
+    out = []
+    for u in cleaned:
         if u in seen:
             continue
         seen.add(u)
-        uniq.append(u)
-    return uniq
+        out.append(u)
+    return out
 
 
-def compact_text(text: str, max_chars: int = 18000) -> str:
+def pick_language_priority(languages: Optional[List[str]]) -> List[str]:
+    if not languages:
+        return ["ko", "en"]
+    out = []
+    for x in languages:
+        s = str(x).strip().lower()
+        if not s:
+            continue
+        out.append(s)
+    # 중복 제거
+    seen = set()
+    uniq = []
+    for s in out:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    return uniq or ["ko", "en"]
+
+
+def compact_text(text: str, max_chars: int) -> str:
     if not text:
         return ""
-    t = " ".join(text.split())
-    if len(t) > max_chars:
-        t = t[:max_chars]
+    t = str(text)
+    # 너무 긴 공백 정리
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    if max_chars and len(t) > max_chars:
+        return t[:max_chars]
     return t
 
 
-def segments_to_text(segments: Any, max_chars: int = 18000) -> str:
+def segments_to_text(segments: Any, max_chars: int = 0) -> str:
     """
-    transcript segments가 리스트라면
-    - {"text": "...", ...} 형태들을 join
+    transcript segments (list[dict]) -> join
+    흔히 Apify가 {"transcript":[{"text":"..."},...]} 형태로 줄 수 있음
     """
-    if not segments:
+    if not segments or not isinstance(segments, list):
         return ""
-    if isinstance(segments, list):
-        parts = []
-        for s in segments:
-            if isinstance(s, dict):
-                parts.append(str(s.get("text", "")).strip())
-            else:
-                parts.append(str(s).strip())
-        text = " ".join([p for p in parts if p])
-        return compact_text(text, max_chars=max_chars)
-    return compact_text(str(segments), max_chars=max_chars)
+    texts = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            txt = seg.get("text") or seg.get("caption") or seg.get("value") or ""
+            if txt:
+                texts.append(str(txt))
+        elif isinstance(seg, str):
+            texts.append(seg)
+    joined = "\n".join(texts).strip()
+    if not joined:
+        return ""
+    return compact_text(joined, max_chars=max_chars if max_chars else len(joined))
