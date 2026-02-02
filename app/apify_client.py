@@ -1,6 +1,9 @@
+# app/apify_client.py
 from __future__ import annotations
-from typing import Any, Dict, Optional
+
 import os
+from typing import Any, Dict, Optional
+
 import httpx
 
 
@@ -9,71 +12,78 @@ class ApifyError(Exception):
 
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-APIFY_TIMEOUT_SEC = float(os.getenv("APIFY_TIMEOUT_SEC", "120"))
-APIFY_ACTOR = os.getenv("APIFY_ACTOR", "starvibe/youtube-video-transcript").strip()
+if not APIFY_TOKEN:
+    # Cloud Run에서 env 없으면 바로 죽게 하고 싶다면 여기서 raise 해도 됨
+    pass
 
-
-def _must_token():
-    if not APIFY_TOKEN:
-        raise ApifyError("APIFY_TOKEN is missing")
+# 이 actor는 OpenAPI에서 이렇게 정의됨:
+# POST /v2/acts/starvibe~youtube-video-transcript/run-sync-get-dataset-items?token=...
+APIFY_ACTOR = os.getenv("APIFY_ACTOR", "starvibe~youtube-video-transcript").strip()
+APIFY_BASE = "https://api.apify.com/v2"
 
 
 async def fetch_transcript_and_metadata(
     youtube_url: str,
     language: str = "ko",
-    timeout_sec: float = APIFY_TIMEOUT_SEC,
-) -> Dict[str, Any]:
-    """
-    Apify Actor를 동기 실행하고 dataset items를 바로 받는다.
-    - 입력 key는 youtube_url (snake_case) 여야 함. :contentReference[oaicite:4]{index=4}
-    """
-    _must_token()
+    timeout_sec: float = 120.0,
+) -> Optional[Dict[str, Any]]:
+    if not APIFY_TOKEN:
+        raise ApifyError("APIFY_TOKEN is missing")
 
-    url = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
-    params = {
-        "token": APIFY_TOKEN,
-        "timeout": int(timeout_sec),
-        # 필요하면 dataset items 포맷도 조절 가능:
-        # "format": "json"
-    }
-
+    # ✅ input schema: youtube_url / language / include_transcript_text ...
     payload = {
         "youtube_url": youtube_url,
         "language": language,
+        "include_transcript_text": True,  # transcript_text 받기
+        "include_transcript": True,       # timestamps 포함 segments도 받기(혹시 transcript_text 비면 대비)
+        "include_video_details": True,    # 메타(조회수/좋아요 등)
     }
 
-    async with httpx.AsyncClient(timeout=timeout_sec + 30) as client:
-        r = await client.post(url, params=params, json=payload)
-        if r.status_code >= 400:
-            raise ApifyError(f"Apify HTTP {r.status_code}: {r.text}")
+    url = f"{APIFY_BASE}/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+    params = {"token": APIFY_TOKEN}
 
-        items = r.json()
-        # Actor마다 items 구조가 다를 수 있는데, 보통 list[dict]
-        if not isinstance(items, list) or not items:
-            return {
-                "ok": False,
-                "error": "EMPTY_DATASET_ITEMS",
-                "raw": items,
-            }
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            r = await client.post(url, params=params, json=payload)
+    except Exception as e:
+        raise ApifyError(f"Apify request failed: {e}")
 
-        it = items[0] if isinstance(items[0], dict) else {}
-        # 최대한 유연하게 매핑 (필드명이 약간 달라도 대비)
-        transcript_text = it.get("transcript_text") or it.get("transcript") or ""
-        # transcript가 list segments일 수도 있음
-        transcript_segments = it.get("transcript") if isinstance(it.get("transcript"), list) else None
+    if r.status_code != 200:
+        raise ApifyError(f"Apify HTTP {r.status_code}: {r.text}")
 
-        return {
-            "ok": True,
-            "title": it.get("title") or it.get("video_title") or "",
-            "description": it.get("description") or "",
-            "channel_name": it.get("channel") or it.get("channel_name") or "",
-            "published_at": it.get("published_at") or it.get("publishedAt") or "",
-            "duration_seconds": it.get("duration_seconds") or it.get("duration") or 0,
-            "view_count": it.get("view_count") or 0,
-            "like_count": it.get("like_count") or 0,
-            "comment_count": it.get("comment_count") or 0,
-            "language": it.get("language") or language,
-            "transcript_text": transcript_text if isinstance(transcript_text, str) else "",
-            "transcript": transcript_segments,
-            "raw": it,
-        }
+    data = r.json()
+    # run-sync-get-dataset-items는 "items 배열"이 오는 형태가 일반적
+    # actor 구현에 따라 [{...}] 또는 {"items":[...]} 둘 다 방어
+    if isinstance(data, dict) and "items" in data:
+        items = data.get("items") or []
+        if items:
+            return _normalize_item(items[0])
+        return None
+
+    if isinstance(data, list) and len(data) > 0:
+        return _normalize_item(data[0])
+
+    return None
+
+
+def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    actor 결과 필드명이 바뀌어도 main.py에서 쓰기 좋게 normalize
+    (네가 이미 meta 잘 뽑히던 형태 유지)
+    """
+    # transcript_text / transcript(segments)는 actor가 주는 그대로 받아두기
+    out = dict(item)
+
+    # 흔한 키들에 대해 alias 처리(없으면 그냥 "")
+    out["title"] = out.get("title") or out.get("video_title") or ""
+    out["description"] = out.get("description") or out.get("video_description") or ""
+    out["channel_name"] = out.get("channel_name") or out.get("channel") or out.get("author") or ""
+    out["published_at"] = out.get("published_at") or out.get("upload_date") or ""
+
+    # 숫자 메타
+    out["duration_seconds"] = out.get("duration_seconds") or out.get("duration") or None
+    out["view_count"] = out.get("view_count") or out.get("views") or None
+    out["like_count"] = out.get("like_count") or out.get("likes") or None
+    out["comment_count"] = out.get("comment_count") or out.get("comments") or None
+
+    return out
