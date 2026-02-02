@@ -2,81 +2,100 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import Any, Dict, Optional
 
 import httpx
 
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-if not GEMINI_API_KEY:
-    # main에서 호출 시 ok:false로 리턴해도 되고, 여기서 raise 해도 됨
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip()
+
+# AI Studio / Generative Language API endpoint (API Key 방식)
+# v1beta가 보편적. (키 기반)
+GEN_LANG_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+class GeminiError(Exception):
     pass
 
 
-async def analyze_with_gemini(
+def _extract_text(resp_json: Dict[str, Any]) -> str:
+    """
+    Gemini 응답에서 텍스트를 최대한 안전하게 뽑음.
+    """
+    # candidates[0].content.parts[0].text 형태가 일반적
+    candidates = resp_json.get("candidates") or []
+    if not candidates:
+        return ""
+
+    c0 = candidates[0]
+    content = c0.get("content") or {}
+    parts = content.get("parts") or []
+    texts = []
+    for p in parts:
+        t = p.get("text")
+        if t:
+            texts.append(t)
+    return "\n".join(texts).strip()
+
+
+def analyze_with_gemini(
     prompt: str,
-    model: str = "gemini-2.5-pro",
+    *,
     max_output_tokens: int = 2048,
-    temperature: float = 0.6,
+    temperature: float = 0.4,
+    timeout_sec: float = 120.0,
 ) -> Dict[str, Any]:
     """
-    Google AI Studio API Key 방식:
-    POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=...
+    prompt를 Gemini에 보내고, "JSON으로 출력"되길 기대.
+    - 성공하면: dict(JSON)
+    - 실패하면: {"ok": False, "error": "...", "raw": "..."} 형태로 반환
     """
     if not GEMINI_API_KEY:
         return {"ok": False, "error": "GEMINI_API_KEY is missing"}
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    url = f"{GEN_LANG_BASE}/models/{GEMINI_MODEL}:generateContent"
     params = {"key": GEMINI_API_KEY}
 
-    payload = {
+    body = {
         "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
+            {"role": "user", "parts": [{"text": prompt}]}
         ],
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_output_tokens,
+            "responseMimeType": "application/json",
         },
     }
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(url, params=params, json=payload)
-    except Exception as e:
-        return {"ok": False, "error": f"Gemini request failed: {e}"}
-
-    if r.status_code != 200:
-        return {
-            "ok": False,
-            "error": f"Gemini HTTP {r.status_code}",
-            "detail": r.text,
-        }
-
-    data = r.json()
-
-    # 응답 텍스트 추출
-    try:
-        text = (
-            data["candidates"][0]["content"]["parts"][0].get("text")
-            if data.get("candidates")
-            else None
+        r = httpx.post(
+            url,
+            params=params,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout_sec,
         )
-    except Exception:
-        text = None
+    except Exception as e:
+        return {"ok": False, "error": f"Gemini request failed: {repr(e)}"}
+
+    if r.status_code >= 400:
+        return {"ok": False, "error": f"Gemini HTTP {r.status_code}", "detail": r.text}
+
+    resp_json = r.json()
+    text = _extract_text(resp_json)
 
     if not text:
-        return {"ok": False, "error": "Gemini returned empty text", "raw": data}
+        return {"ok": False, "error": "Gemini returned empty text", "raw": resp_json}
 
-    # 우리가 prompt에서 JSON만 뽑게 유도했다면 여기서 json.loads 시도
-    text_stripped = text.strip()
-    if text_stripped.startswith("{") and text_stripped.endswith("}"):
-        try:
-            return {"ok": True, "json": __import__("json").loads(text_stripped)}
-        except Exception:
-            # JSON parse 실패해도 raw text는 남김
-            return {"ok": True, "text": text_stripped, "warning": "JSON_PARSE_FAILED"}
-
-    return {"ok": True, "text": text_stripped}
+    # JSON 파싱 시도
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            parsed.setdefault("ok", True)
+            return parsed
+        return {"ok": True, "data": parsed}
+    except Exception:
+        # JSON이 깨졌으면 raw 텍스트를 같이 남김
+        return {"ok": False, "error": "Gemini output is not valid JSON", "raw_text": text}
