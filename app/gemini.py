@@ -1,45 +1,39 @@
-import os
+# app/gemini.py
+from __future__ import annotations
+
+import os, json
 from typing import Dict, Any
 from google import genai
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+if not GEMINI_API_KEY:
+    # import 시점에 바로 죽이면 Cloud Run health도 죽어서,
+    # 런타임에서 체크하게 두고 싶으면 여기서 raise하지 말고 client=None로 두는 방법도 있음.
+    pass
 
-def analyze_video_with_gemini(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    payload:
-      - title (원문)
-      - description (300자 컷)
-      - transcript (전체 자막)
-    """
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+def analyze_with_gemini(prompt: str, max_output_tokens: int = 2048) -> Dict[str, Any]:
+    if client is None:
+        return {"ok": False, "error": "GEMINI_API_KEY is missing"}
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": payload["prompt"]
-                    }
-                ]
-            }
-        ],
+        contents=[{"role": "user", "parts": [{"text": prompt}]}],
         generation_config={
             "temperature": 0.3,
-            "max_output_tokens": 2048
-        }
+            "max_output_tokens": max_output_tokens,
+        },
     )
 
-    # JSON 강제 (실패 대비)
-    text = response.text.strip()
+    text = (response.text or "").strip()
     try:
         return json.loads(text)
     except Exception:
         return {
             "ok": False,
             "error": "Gemini output not valid JSON",
-            "raw": text[:2000]
+            "raw": text[:5000],
         }
