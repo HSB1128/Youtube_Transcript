@@ -183,34 +183,78 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
     # 채널 프로필 (Gemini 영상 분석이 ok=true인 것만 모아서)
     channel_profile: Optional[Dict[str, Any]] = None
     if req.make_channel_profile:
-        analyses: List[Dict[str, Any]] = []
-        for v in videos:
-            if not v.get("ok"):
-                continue
-            va = v.get("videoAnalysis")
-            if not isinstance(va, dict) or va.get("ok") is False:
-                continue
-            analyses.append({
-                "index": v.get("index"),
-                "url": v.get("url"),
-                "meta": v.get("meta"),
-                "analysis": va.get("text") or va,
-            })
+    analyses: List[Dict[str, Any]] = []
+    for v in videos:
+        if not v.get("ok"):
+            continue
+        va = v.get("videoAnalysis")
+        if not isinstance(va, dict) or va.get("ok") is False:
+            continue
 
-        if analyses:
+        text = (va.get("text") or "").strip()
+
+        # 1) 영상별 분석 JSON 파싱 시도
+        parsed = None
+        if text:
             try:
-                prompt = build_channel_profile_prompt(analyses)
-                # ✅ 여기서 터지던 await dict 문제 해결: thread로 돌리고 await
-                channel_profile = await asyncio.to_thread(
-                    analyze_with_gemini,
-                    prompt,
-                    max_output_tokens=2048
-                )
-            except Exception as e:
-                channel_profile = {"ok": False, "error": str(e)}
-        else:
-            channel_profile = {"ok": False, "error": "No valid per-video analyses to build channel profile"}
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
 
+        # 2) 필요한 필드만 축약 (SRT1/채널 프로필에 필요한 것만)
+        if isinstance(parsed, dict) and parsed.get("ok") is True:
+            slim = {
+                "video_index": parsed.get("video_index"),
+                "hook": {
+                    "summary": (parsed.get("hook") or {}).get("summary"),
+                    "techniques": (parsed.get("hook") or {}).get("techniques") or [],
+                    "frames": (parsed.get("hook") or {}).get("frames") or [],
+                },
+                "structure": {
+                    "template": (parsed.get("structure") or {}).get("template"),
+                    "beats": (parsed.get("structure") or {}).get("beats") or [],
+                    "pacing": (parsed.get("structure") or {}).get("pacing"),
+                },
+                "style_tone": {
+                    "persona": (parsed.get("style_tone") or {}).get("persona"),
+                    "narration_style": (parsed.get("style_tone") or {}).get("narration_style"),
+                    "tone_keywords": (parsed.get("style_tone") or {}).get("tone_keywords") or [],
+                },
+                "retention": {
+                    "recurring_devices": (parsed.get("retention") or {}).get("recurring_devices") or [],
+                    "cta": (parsed.get("retention") or {}).get("cta"),
+                },
+                "quotes": parsed.get("quotes") or {"items": []},
+            }
+        else:
+            # 파싱 실패 시 최소정보만 남겨서 넣기(길이 폭발 방지)
+            slim = {"raw_text": text[:1200]}
+
+        analyses.append({
+            "index": v.get("index"),
+            "url": v.get("url"),
+            "meta": {
+                "title": (v.get("meta") or {}).get("title", ""),
+                "channel": (v.get("meta") or {}).get("channel", ""),
+                "published_at": (v.get("meta") or {}).get("published_at", ""),
+                "language": (v.get("meta") or {}).get("language", ""),
+            },
+            "dna": slim,
+        })
+
+    if analyses:
+        try:
+            analyses_json = json.dumps(analyses, ensure_ascii=False)
+            prompt = build_channel_profile_prompt(analyses_json)
+            channel_profile = await asyncio.to_thread(
+                analyze_with_gemini,
+                prompt,
+                max_output_tokens=2048
+            )
+        except Exception as e:
+            channel_profile = {"ok": False, "error": str(e)}
+    else:
+        channel_profile = {"ok": False, "error": "No valid per-video analyses to build channel profile"}
     warnings = _build_warnings(videos)
 
     return {
