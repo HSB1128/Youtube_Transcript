@@ -21,9 +21,14 @@ def build_video_analysis_prompt(
 - transcript_text에 근거가 없는 내용은 만들지 마라
 
 [인용(Quotes) 규칙]
-- quotes.items[].text는 transcript_text 안에 "그대로 존재하는 문장"만 허용
+- quotes.items[].text는 transcript_text 안에 "그대로 존재하는 연속 구절"만 허용
+- quotes.items[].text는 너무 길면 잘라서 넣어도 되나, 최대 20단어(또는 120자) 이내로 제한
 - 해당 문장을 찾을 수 없으면 quotes.items = []
 - evidence.approx_start_sec는 '대략'이면 되고, 자신 없으면 0으로 두고 near_keywords라도 채워라
+
+[표현 특징(Expression Markers) 규칙]
+- expression_markers는 transcript_text에서 반복되는 "표현 방식/기호/말버릇"만 기록
+- 내용(주제) 자체를 요약하거나 추가로 해석하지 마라
 
 [JSON 스키마]
 {{
@@ -52,6 +57,13 @@ def build_video_analysis_prompt(
     "tone_keywords": ["키워드 5개"]
   }},
 
+  "expression_markers": {{
+    "punctuation": ["자주 쓰는 문장부호/표현기호 최대 6개"],
+    "catchphrases": ["반복되는 말버릇/고정 문구 최대 6개"],
+    "rhythm": "문장 호흡 특징(짧게)",
+    "numbers_style": "숫자/단위/비교 제시 방식(짧게)"
+  }},
+
   "retention": {{
     "recurring_devices": ["반복 장치/고정 코너/리듬 장치"],
     "cta": ["CTA 유형/문장 프레임(최대 3개)"]
@@ -60,7 +72,7 @@ def build_video_analysis_prompt(
   "quotes": {{
     "items": [
       {{
-        "text": "transcript에 실제로 있는 문장",
+        "text": "transcript에 실제로 있는 연속 구절(20단어/120자 이내)",
         "evidence": {{
           "approx_start_sec": 0,
           "near_keywords": ["근처 키워드1", "근처 키워드2"]
@@ -131,4 +143,24 @@ def build_channel_profile_prompt(analyses_json: str) -> str:
 
 [형식 DNA 모음(JSON)]
 {analyses_json}
+""".strip()
+
+
+def build_json_repair_prompt(schema_name: str, raw_text: str) -> str:
+    return f"""
+너는 JSON 포맷 복구기다.
+아래 텍스트는 모델의 출력인데, 순수 JSON이 아니거나 스키마를 어겼다.
+
+[규칙]
+- 반드시 순수 JSON만 출력
+- 마크다운/코드펜스/설명/추가 텍스트 절대 금지
+- 새로운 정보 생성 금지: 원문 텍스트에 없는 내용은 넣지 마라
+- 값이 불확실하면 빈 값/빈 배열/0으로 둬라
+- 키는 스키마에 있는 것만 허용(추가 키 금지)
+
+[schema_name]
+{schema_name}
+
+[raw_output]
+{raw_text}
 """.strip()
