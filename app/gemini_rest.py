@@ -2,25 +2,32 @@
 import os
 from google import genai
 
-PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID")
 LOCATION = os.getenv("GEMINI_LOCATION", "us-central1")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-if not PROJECT:
-    raise RuntimeError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT/PROJECT_ID) env var")
+_client = None
 
-_client = genai.Client(
-    vertexai=True,
-    project=PROJECT,
-    location=LOCATION,
-)
+def _get_client():
+    global _client
+    if _client is not None:
+        return _client
+
+    project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID")
+    if not project:
+        raise RuntimeError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT/PROJECT_ID) env var")
+
+    _client = genai.Client(
+        vertexai=True,
+        project=project,
+        location=LOCATION,
+    )
+    return _client
 
 def analyze_with_gemini(prompt: str, max_output_tokens: int = 2048) -> dict:
-    resp = _client.models.generate_content(
+    client = _get_client()
+    resp = client.models.generate_content(
         model=MODEL,
         contents=prompt,
-        # generation_config는 버전에 따라 형태가 달라져서
-        # 최소 구현에서는 빼는 게 안전함.
     )
     return {
         "ok": True,
