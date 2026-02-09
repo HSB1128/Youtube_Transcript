@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.apify_client import fetch_transcript_and_metadata, ApifyError
 from app.gemini_rest import analyze_with_gemini
-from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt
+from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt, build_json_repair_prompt
 from app.utils import normalize_urls, pick_language_priority, compact_text, segments_to_text
 
 app = FastAPI(title="YouTube Transcript + Channel Profile (Apify + Gemini)")
@@ -42,6 +42,33 @@ def _parse_body_allow_string_json(body: Any) -> Dict[str, Any]:
     if not isinstance(body, dict):
         raise HTTPException(400, "Body must be a JSON object")
     return body
+
+
+def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """
+    videoAnalysis.text가 '순수 JSON'일 수도 있고,
+    혹시라도 코드펜스가 섞일 수도 있으니 (방어적으로) 둘 다 처리.
+    """
+    if not text:
+        return None
+    t = text.strip()
+
+    # 1) ```json ... ``` 우선 추출
+    if "```" in t:
+        import re
+        m = re.search(r"```json\s*([\s\S]*?)```", t, re.IGNORECASE)
+        if m:
+            t = m.group(1).strip()
+        else:
+            m2 = re.search(r"```\s*([\s\S]*?)```", t)
+            if m2:
+                t = m2.group(1).strip()
+
+    # 2) JSON 파싱
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
 
 
 async def _process_one(
@@ -116,7 +143,8 @@ async def _process_one(
             "language": apify_data.get("language"),
         }
 
-        # 3) Gemini 영상별 분석
+        # 3) Gemini 영상별 분석 (JSON 보장: 실패하면 1회 복구 시도)
+        analysis_text = ""
         try:
             prompt = build_video_analysis_prompt(
                 index=idx,
@@ -124,14 +152,38 @@ async def _process_one(
                 description=(meta.get("description", "") or "")[:300],
                 transcript_text=transcript_text,
             )
-            # analyze_with_gemini는 sync(dict 리턴)일 수 있으니 thread로 돌린다
-            analysis = await asyncio.to_thread(
+            first = await asyncio.to_thread(
                 analyze_with_gemini,
                 prompt,
                 max_output_tokens=2048
             )
+            analysis_text = (first.get("text") or "").strip()
+
+            # 1차 JSON 파싱 검사
+            parsed = _extract_json_from_text(analysis_text)
+
+            # 실패하면 1회 복구 시도
+            if parsed is None:
+                repair_prompt = build_json_repair_prompt(
+                    schema_name="video_analysis",
+                    raw_text=analysis_text[:6000],
+                )
+                second = await asyncio.to_thread(
+                    analyze_with_gemini,
+                    repair_prompt,
+                    max_output_tokens=2048
+                )
+                analysis_text = (second.get("text") or "").strip()
+
+                # 2차 파싱 재검사
+                parsed2 = _extract_json_from_text(analysis_text)
+                if parsed2 is None:
+                    raise ValueError("Gemini output is not valid JSON even after repair")
+
+            analysis = {"ok": True, "text": analysis_text}
+
         except Exception as e:
-            analysis = {"ok": False, "error": str(e)}
+            analysis = {"ok": False, "error": str(e), "text": analysis_text[:1200]}
 
         return {
             "index": idx,
@@ -164,33 +216,6 @@ def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "error": va.get("error"),
             })
     return warns
-
-
-def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    """
-    videoAnalysis.text가 '순수 JSON'일 수도 있고,
-    혹시라도 코드펜스가 섞일 수도 있으니 (방어적으로) 둘 다 처리.
-    """
-    if not text:
-        return None
-    t = text.strip()
-
-    # 1) ```json ... ``` 우선 추출
-    if "```" in t:
-        import re
-        m = re.search(r"```json\s*([\s\S]*?)```", t, re.IGNORECASE)
-        if m:
-            t = m.group(1).strip()
-        else:
-            m2 = re.search(r"```\s*([\s\S]*?)```", t)
-            if m2:
-                t = m2.group(1).strip()
-
-    # 2) JSON 파싱
-    try:
-        return json.loads(t)
-    except Exception:
-        return None
 
 
 async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
@@ -230,6 +255,7 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
                 hook = parsed.get("hook") or {}
                 structure = parsed.get("structure") or {}
                 style_tone = parsed.get("style_tone") or {}
+                expression_markers = parsed.get("expression_markers") or {}
                 retention = parsed.get("retention") or {}
                 quotes = parsed.get("quotes") or {"items": []}
 
@@ -249,6 +275,12 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
                         "persona": style_tone.get("persona"),
                         "narration_style": style_tone.get("narration_style"),
                         "tone_keywords": style_tone.get("tone_keywords") or [],
+                    },
+                    "expression_markers": {
+                        "punctuation": expression_markers.get("punctuation") or [],
+                        "catchphrases": expression_markers.get("catchphrases") or [],
+                        "rhythm": expression_markers.get("rhythm"),
+                        "numbers_style": expression_markers.get("numbers_style"),
                     },
                     "retention": {
                         "recurring_devices": retention.get("recurring_devices") or [],
