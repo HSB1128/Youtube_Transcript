@@ -8,9 +8,20 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.apify_client import fetch_transcript_and_metadata, ApifyError
+from app.apify_client import (
+    fetch_transcript_and_metadata,
+    fetch_audio_url_from_converter,
+    ApifyError,
+)
+from app.audio_bytes import download_audio_bytes
+from app.gemini_audio import transcribe_audio_bytes
+
 from app.gemini_rest import analyze_with_gemini
-from app.prompts import build_video_analysis_prompt, build_channel_profile_prompt, build_json_repair_prompt
+from app.prompts import (
+    build_video_analysis_prompt,
+    build_channel_profile_prompt,
+    build_json_repair_prompt,
+)
 from app.utils import normalize_urls, pick_language_priority, compact_text, segments_to_text
 
 app = FastAPI(title="YouTube Transcript + Channel Profile (Apify + Gemini)")
@@ -56,6 +67,7 @@ def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     # 1) ```json ... ``` 우선 추출
     if "```" in t:
         import re
+
         m = re.search(r"```json\s*([\s\S]*?)```", t, re.IGNORECASE)
         if m:
             t = m.group(1).strip()
@@ -113,9 +125,56 @@ async def _process_one(
         if not transcript_text:
             transcript_text = segments_to_text(
                 apify_data.get("transcript"),
-                max_chars=MAX_TRANSCRIPT_CHARS
+                max_chars=MAX_TRANSCRIPT_CHARS,
             )
 
+        # ✅ transcript_source 추적 (기본은 apify)
+        transcript_source = "apify_transcript"
+
+        # ✅ transcript가 없으면 fallback: converter → audio bytes → Gemini Audio STT
+        if not transcript_text:
+            try:
+                conv = await fetch_audio_url_from_converter(
+                    youtube_url=url,
+                    timeout_sec=APIFY_TIMEOUT_SEC,
+                    token=APIFY_TOKEN,
+                    actor_id="tazy~youtube-converter",
+                )
+                audio_url = (conv.get("audio_url") or "").strip()
+                if not audio_url:
+                    raise ValueError("NO_AUDIO_URL_FROM_CONVERTER")
+
+                dl = await download_audio_bytes(audio_url=audio_url)
+
+                stt = await asyncio.to_thread(
+                    transcribe_audio_bytes,
+                    audio_bytes=dl["bytes"],
+                    mime_type=dl["mime_type"],
+                    language_hint=(apify_data.get("language") or lang_priority[0] or "ko"),
+                )
+
+                transcript_text = compact_text(
+                    stt.get("text") or "",
+                    max_chars=MAX_TRANSCRIPT_CHARS,
+                )
+                transcript_source = "gemini_audio_stt"
+
+            except Exception as e:
+                return {
+                    "index": idx,
+                    "url": url,
+                    "ok": False,
+                    "stage": "transcript_fallback",
+                    "meta": {
+                        "title": apify_data.get("title", ""),
+                        "channel": apify_data.get("channel_name", ""),
+                        "published_at": apify_data.get("published_at", ""),
+                        "language": apify_data.get("language"),
+                    },
+                    "error": f"FALLBACK_STT_FAILED: {str(e)}",
+                }
+
+        # ✅ fallback까지 했는데도 텍스트가 없으면 실패
         if not transcript_text:
             return {
                 "index": idx,
@@ -128,7 +187,7 @@ async def _process_one(
                     "published_at": apify_data.get("published_at", ""),
                     "language": apify_data.get("language"),
                 },
-                "error": "NO_TRANSCRIPT_RETURNED_BY_APIFY",
+                "error": "NO_TRANSCRIPT_AFTER_FALLBACK",
             }
 
         meta = {
@@ -155,7 +214,7 @@ async def _process_one(
             first = await asyncio.to_thread(
                 analyze_with_gemini,
                 prompt,
-                max_output_tokens=2048
+                max_output_tokens=2048,
             )
             analysis_text = (first.get("text") or "").strip()
 
@@ -171,7 +230,7 @@ async def _process_one(
                 second = await asyncio.to_thread(
                     analyze_with_gemini,
                     repair_prompt,
-                    max_output_tokens=2048
+                    max_output_tokens=2048,
                 )
                 analysis_text = (second.get("text") or "").strip()
 
@@ -188,8 +247,9 @@ async def _process_one(
         return {
             "index": idx,
             "url": url,
-            "ok": True,  # Apify/transcript는 성공했으니 True 유지
+            "ok": True,
             "meta": meta,
+            "transcript_source": transcript_source,
             "transcript_chars": len(transcript_text),
             "videoAnalysis": analysis,
         }
@@ -199,22 +259,26 @@ def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     warns: List[Dict[str, Any]] = []
     for v in videos:
         if not v.get("ok"):
-            warns.append({
-                "index": v.get("index"),
-                "url": v.get("url"),
-                "stage": v.get("stage"),
-                "error": v.get("error"),
-            })
+            warns.append(
+                {
+                    "index": v.get("index"),
+                    "url": v.get("url"),
+                    "stage": v.get("stage"),
+                    "error": v.get("error"),
+                }
+            )
             continue
 
         va = v.get("videoAnalysis") or {}
         if isinstance(va, dict) and va.get("ok") is False:
-            warns.append({
-                "index": v.get("index"),
-                "url": v.get("url"),
-                "stage": "gemini_video_analysis",
-                "error": va.get("error"),
-            })
+            warns.append(
+                {
+                    "index": v.get("index"),
+                    "url": v.get("url"),
+                    "stage": "gemini_video_analysis",
+                    "error": va.get("error"),
+                }
+            )
     return warns
 
 
@@ -226,10 +290,7 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
     lang_priority = pick_language_priority(req.languages)
     sem = asyncio.Semaphore(req.concurrency)
 
-    tasks = [
-        _process_one(i + 1, u, lang_priority, sem)
-        for i, u in enumerate(urls)
-    ]
+    tasks = [_process_one(i + 1, u, lang_priority, sem) for i, u in enumerate(urls)]
     videos = await asyncio.gather(*tasks)
 
     # 채널 프로필 (Gemini 영상 분석이 ok=true인 것만 모아서)
@@ -292,17 +353,19 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
                 # 파싱 실패 시 최소정보만 남겨서 넣기(길이 폭발 방지)
                 slim = {"raw_text": text[:1200]}
 
-            analyses.append({
-                "index": v.get("index"),
-                "url": v.get("url") or "",
-                "meta": {
-                    "title": (v.get("meta") or {}).get("title", ""),
-                    "channel": (v.get("meta") or {}).get("channel", ""),
-                    "published_at": (v.get("meta") or {}).get("published_at", ""),
-                    "language": (v.get("meta") or {}).get("language", ""),
-                },
-                "dna": slim,
-            })
+            analyses.append(
+                {
+                    "index": v.get("index"),
+                    "url": v.get("url") or "",
+                    "meta": {
+                        "title": (v.get("meta") or {}).get("title", ""),
+                        "channel": (v.get("meta") or {}).get("channel", ""),
+                        "published_at": (v.get("meta") or {}).get("published_at", ""),
+                        "language": (v.get("meta") or {}).get("language", ""),
+                    },
+                    "dna": slim,
+                }
+            )
 
         if analyses:
             try:
@@ -311,12 +374,15 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
                 channel_profile = await asyncio.to_thread(
                     analyze_with_gemini,
                     prompt,
-                    max_output_tokens=2048
+                    max_output_tokens=2048,
                 )
             except Exception as e:
                 channel_profile = {"ok": False, "error": str(e)}
         else:
-            channel_profile = {"ok": False, "error": "No valid per-video analyses to build channel profile"}
+            channel_profile = {
+                "ok": False,
+                "error": "No valid per-video analyses to build channel profile",
+            }
 
     warnings = _build_warnings(videos)
 
