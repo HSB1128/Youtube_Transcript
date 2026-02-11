@@ -85,3 +85,55 @@ async def fetch_transcript_and_metadata(
         "raw": item,  # 디버깅용
     }
     return out
+
+async def fetch_audio_url_from_converter(
+    *,
+    youtube_url: str,
+    timeout_sec: float,
+    token: str,
+    actor_id: str = "tazy~youtube-converter",
+) -> Dict[str, Any]:
+    """
+    자막이 없을 때 fallback용: youtube-converter actor로 오디오 URL 얻기
+    """
+    if not token:
+        raise ApifyError("APIFY_TOKEN is missing")
+
+    endpoint = _actor_endpoint(actor_id)
+    params = {
+        "token": token,
+        "format": "json",
+    }
+
+    # ⚠️ actor input schema는 실제와 다를 수 있음.
+    # 일단 최소로 youtube_url만 보냄. (응답 raw 1번만 확인하면 키 확정 가능)
+    payload = {
+        "youtube_url": youtube_url,
+    }
+
+    async with httpx.AsyncClient(timeout=timeout_sec) as client:
+        r = await client.post(endpoint, params=params, json=payload)
+
+    if r.status_code >= 400:
+        raise ApifyError(f"Apify HTTP {r.status_code}: {r.text}")
+
+    data = r.json()
+
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        item = data[0]
+    elif isinstance(data, dict):
+        item = data
+    else:
+        raise ApifyError(f"Apify returned unexpected payload: {type(data)}")
+
+    audio_url = (
+        item.get("audioUrl")
+        or item.get("audio_url")
+        or item.get("mp3Url")
+        or item.get("mp3_url")
+        or item.get("url")
+        or item.get("downloadUrl")
+        or ""
+    )
+
+    return {"audio_url": str(audio_url).strip(), "raw": item}
