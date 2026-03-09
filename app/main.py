@@ -10,12 +10,10 @@ from pydantic import BaseModel, Field
 
 from app.apify_client import (
     fetch_transcript_and_metadata,
-    fetch_audio_url_from_converter,
+    fetch_audio_bytes_from_converter,
     ApifyError,
 )
-from app.audio_bytes import download_audio_bytes
 from app.gemini_audio import transcribe_audio_bytes
-
 from app.gemini_rest import analyze_with_gemini
 from app.prompts import (
     build_video_analysis_prompt,
@@ -30,6 +28,7 @@ DEFAULT_CONCURRENCY = int(os.getenv("CONCURRENCY", "4"))
 APIFY_TIMEOUT_SEC = float(os.getenv("APIFY_TIMEOUT_SEC", "120"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "18000"))
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
+APIFY_YOUTUBE_COOKIES = os.getenv("APIFY_YOUTUBE_COOKIES", "").strip()
 
 
 class AnalyzeReq(BaseModel):
@@ -57,14 +56,14 @@ def _parse_body_allow_string_json(body: Any) -> Dict[str, Any]:
 
 def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
-    videoAnalysis.text가 '순수 JSON'일 수도 있고,
-    혹시라도 코드펜스가 섞일 수도 있으니 (방어적으로) 둘 다 처리.
+    videoAnalysis.text가 순수 JSON일 수도 있고,
+    혹시라도 코드펜스가 섞일 수도 있으니 둘 다 처리.
     """
     if not text:
         return None
+
     t = text.strip()
 
-    # 1) ```json ... ``` 우선 추출
     if "```" in t:
         import re
 
@@ -76,7 +75,6 @@ def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
             if m2:
                 t = m2.group(1).strip()
 
-    # 2) JSON 파싱
     try:
         return json.loads(t)
     except Exception:
@@ -90,7 +88,7 @@ async def _process_one(
     sem: asyncio.Semaphore,
 ) -> Dict[str, Any]:
     async with sem:
-        # 1) Apify (언어 우선순위대로 시도)
+        # 1) transcript actor (언어 우선순위대로 시도)
         apify_data: Optional[Dict[str, Any]] = None
         apify_error: Optional[str] = None
 
@@ -128,28 +126,23 @@ async def _process_one(
                 max_chars=MAX_TRANSCRIPT_CHARS,
             )
 
-        # ✅ transcript_source 추적 (기본은 apify)
         transcript_source = "apify_transcript"
 
-        # ✅ transcript가 없으면 fallback: converter → audio bytes → Gemini Audio STT
+        # 3) transcript 없으면 fallback: converter -> mp3 bytes -> Gemini STT
         if not transcript_text:
             try:
-                conv = await fetch_audio_url_from_converter(
+                conv = await fetch_audio_bytes_from_converter(
                     youtube_url=url,
                     timeout_sec=APIFY_TIMEOUT_SEC,
                     token=APIFY_TOKEN,
                     actor_id="tazy~youtube-converter",
+                    cookies_text=APIFY_YOUTUBE_COOKIES,
                 )
-                audio_url = (conv.get("audio_url") or "").strip()
-                if not audio_url:
-                    raise ValueError("NO_AUDIO_URL_FROM_CONVERTER")
-
-                dl = await download_audio_bytes(audio_url=audio_url)
 
                 stt = await asyncio.to_thread(
                     transcribe_audio_bytes,
-                    audio_bytes=dl["bytes"],
-                    mime_type=dl["mime_type"],
+                    audio_bytes=conv["bytes"],
+                    mime_type=conv["mime_type"],
                     language_hint=(apify_data.get("language") or lang_priority[0] or "ko"),
                 )
 
@@ -174,7 +167,6 @@ async def _process_one(
                     "error": f"FALLBACK_STT_FAILED: {str(e)}",
                 }
 
-        # ✅ fallback까지 했는데도 텍스트가 없으면 실패
         if not transcript_text:
             return {
                 "index": idx,
@@ -202,7 +194,7 @@ async def _process_one(
             "language": apify_data.get("language"),
         }
 
-        # 3) Gemini 영상별 분석 (JSON 보장: 실패하면 1회 복구 시도)
+        # 4) Gemini 영상별 분석
         analysis_text = ""
         try:
             prompt = build_video_analysis_prompt(
@@ -211,6 +203,7 @@ async def _process_one(
                 description=(meta.get("description", "") or "")[:300],
                 transcript_text=transcript_text,
             )
+
             first = await asyncio.to_thread(
                 analyze_with_gemini,
                 prompt,
@@ -218,13 +211,11 @@ async def _process_one(
             )
             analysis_text = (first.get("text") or "").strip()
 
-            # 1차 JSON 파싱 검사
             parsed = _extract_json_from_text(analysis_text)
 
-            # 실패하면 1회 복구 시도
             if parsed is None:
                 repair_prompt = build_json_repair_prompt(
-                    schema_name="video_analysis",
+                    schema_json="video_analysis",
                     raw_text=analysis_text[:6000],
                 )
                 second = await asyncio.to_thread(
@@ -234,7 +225,6 @@ async def _process_one(
                 )
                 analysis_text = (second.get("text") or "").strip()
 
-                # 2차 파싱 재검사
                 parsed2 = _extract_json_from_text(analysis_text)
                 if parsed2 is None:
                     raise ValueError("Gemini output is not valid JSON even after repair")
@@ -257,6 +247,7 @@ async def _process_one(
 
 def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     warns: List[Dict[str, Any]] = []
+
     for v in videos:
         if not v.get("ok"):
             warns.append(
@@ -279,6 +270,7 @@ def _build_warnings(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "error": va.get("error"),
                 }
             )
+
     return warns
 
 
@@ -293,8 +285,8 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
     tasks = [_process_one(i + 1, u, lang_priority, sem) for i, u in enumerate(urls)]
     videos = await asyncio.gather(*tasks)
 
-    # 채널 프로필 (Gemini 영상 분석이 ok=true인 것만 모아서)
     channel_profile: Optional[Dict[str, Any]] = None
+
     if req.make_channel_profile:
         analyses: List[Dict[str, Any]] = []
 
@@ -307,11 +299,8 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
                 continue
 
             text = (va.get("text") or "").strip()
-
-            # 1) 영상별 분석 JSON 파싱 시도
             parsed = _extract_json_from_text(text)
 
-            # 2) 필요한 필드만 축약 (채널 프로필에 필요한 '형식 DNA'만)
             if isinstance(parsed, dict) and parsed.get("ok") is True:
                 hook = parsed.get("hook") or {}
                 structure = parsed.get("structure") or {}
@@ -350,7 +339,6 @@ async def _analyze_impl(req: AnalyzeReq) -> Dict[str, Any]:
                     "quotes": quotes,
                 }
             else:
-                # 파싱 실패 시 최소정보만 남겨서 넣기(길이 폭발 방지)
                 slim = {"raw_text": text[:1200]}
 
             analyses.append(
@@ -404,7 +392,6 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
 
     body = _parse_body_allow_string_json(body)
 
-    # 호환: languages_priority -> languages
     if "languages_priority" in body and "languages" not in body:
         body["languages"] = body.get("languages_priority")
 
@@ -416,7 +403,6 @@ async def analyze_and_profile(request: Request) -> Dict[str, Any]:
     return await _analyze_impl(req)
 
 
-# n8n 호환: /analyze 로 보내도 동일 처리
 @app.post("/analyze")
 async def analyze(request: Request) -> Dict[str, Any]:
     return await analyze_and_profile(request)
