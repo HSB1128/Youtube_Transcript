@@ -4,7 +4,6 @@ import os
 from google import genai
 from google.genai import types
 
-LOCATION = os.getenv("GEMINI_LOCATION", "us-central1")
 MODEL_AUDIO = os.getenv("GEMINI_MODEL_AUDIO", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
 _client = None
@@ -15,15 +14,11 @@ def _get_client():
     if _client is not None:
         return _client
 
-    project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID")
-    if not project:
-        raise RuntimeError("Missing GOOGLE_CLOUD_PROJECT (or GCP_PROJECT/PROJECT_ID) env var")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY env var")
 
-    _client = genai.Client(
-        vertexai=True,
-        project=project,
-        location=LOCATION,
-    )
+    _client = genai.Client(api_key=api_key)
     return _client
 
 
