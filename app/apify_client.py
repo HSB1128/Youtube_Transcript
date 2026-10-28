@@ -104,13 +104,13 @@ async def fetch_audio_bytes_from_converter(
     youtube_url: str,
     timeout_sec: float,
     token: str,
-    actor_id: str = "tazy~youtube-converter",
+    actor_id: str = "johnvc~youtube-download-api",
     cookies_text: str = "",
 ) -> Dict[str, Any]:
     """
-    tazy/youtube-converter actor 문서 기준:
-    - 입력: videoUrl, format, quality, cookiesText 등
-    - 결과 파일: default key-value store의 OUTPUT_FILE
+    johnvc/youtube-download-api actor 문서 기준:
+    - 입력: videoUrls, format, audioFormat, cookies 등
+    - 결과 파일: dataset item의 fileKey가 가리키는 default key-value store 레코드
     """
     if not token:
         raise ApifyError("APIFY_TOKEN is missing")
@@ -122,13 +122,13 @@ async def fetch_audio_bytes_from_converter(
     }
 
     payload: Dict[str, Any] = {
-        "videoUrl": youtube_url,
-        "format": "mp3",
-        "healthCheck": False,
+        "videoUrls": [youtube_url],
+        "format": "audio",
+        "audioFormat": "mp3",
     }
 
     if cookies_text.strip():
-        payload["cookiesText"] = cookies_text.strip()
+        payload["cookies"] = cookies_text.strip()
 
     async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
         # 1) actor run 시작
@@ -146,6 +146,7 @@ async def fetch_audio_bytes_from_converter(
         run_id = run_data.get("id")
         status = run_data.get("status")
         kvs_id = run_data.get("defaultKeyValueStoreId")
+        dataset_id = run_data.get("defaultDatasetId")
 
         if not run_id:
             raise ApifyError("Converter run response missing run id")
@@ -168,6 +169,7 @@ async def fetch_audio_bytes_from_converter(
             run_data = poll_resp.json().get("data") or {}
             status = run_data.get("status")
             kvs_id = run_data.get("defaultKeyValueStoreId") or kvs_id
+            dataset_id = run_data.get("defaultDatasetId") or dataset_id
 
         if status != "SUCCEEDED":
             raise ApifyError(f"Converter run did not succeed: status={status}")
@@ -175,20 +177,40 @@ async def fetch_audio_bytes_from_converter(
         if not kvs_id:
             raise ApifyError("Converter run missing defaultKeyValueStoreId")
 
-        # 3) OUTPUT_FILE 다운로드
+        if not dataset_id:
+            raise ApifyError("Converter run missing defaultDatasetId")
+
+        # 3) dataset item에서 fileKey 확인
+        items_resp = await client.get(
+            f"{APIFY_API_BASE}/datasets/{dataset_id}/items",
+            params={"format": "json"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        if items_resp.status_code >= 400:
+            raise ApifyError(f"Failed to fetch converter dataset {items_resp.status_code}: {items_resp.text[:300]}")
+
+        items = items_resp.json()
+        item = items[0] if isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict) else {}
+        file_key = item.get("fileKey")
+
+        if not file_key:
+            raise ApifyError(f"Converter dataset has no fileKey: {items_resp.text[:300]}")
+
+        # 4) fileKey 레코드 다운로드
         file_resp = await client.get(
-            _kvs_record_endpoint(kvs_id, "OUTPUT_FILE"),
+            _kvs_record_endpoint(kvs_id, file_key),
             headers={"Authorization": f"Bearer {token}"},
         )
 
         if file_resp.status_code >= 400:
-            raise ApifyError(f"Failed to fetch OUTPUT_FILE {file_resp.status_code}: {file_resp.text[:300]}")
+            raise ApifyError(f"Failed to fetch {file_key} {file_resp.status_code}: {file_resp.text[:300]}")
 
         content_type = (file_resp.headers.get("content-type") or "").split(";")[0].strip()
         data = file_resp.content
 
     if not data:
-        raise ApifyError("OUTPUT_FILE is empty")
+        raise ApifyError(f"{file_key} is empty")
 
     return {
         "bytes": data,

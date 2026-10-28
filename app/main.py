@@ -135,7 +135,7 @@ async def _process_one(
                     youtube_url=url,
                     timeout_sec=APIFY_TIMEOUT_SEC,
                     token=APIFY_TOKEN,
-                    actor_id="tazy~youtube-converter",
+                    actor_id="johnvc~youtube-download-api",
                     cookies_text=APIFY_YOUTUBE_COOKIES,
                 )
 
